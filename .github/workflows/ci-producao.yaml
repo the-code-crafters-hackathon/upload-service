@@ -1,0 +1,55 @@
+name: CI - producao
+
+on:
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  producao-ci: 
+    name: "Run Tests + SonarCloud"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+
+          if [ -f .docker/bin/config/requirements.txt ]; then
+            pip install -r .docker/bin/config/requirements.txt
+          else
+            echo "Arquivo .docker/bin/config/requirements.txt não encontrado."
+            exit 1
+          fi
+
+          pip install pytest pytest-cov
+
+      - name: Run tests
+        env:
+          PYTHONPATH: .
+          DATABASE_URL: "sqlite+pysqlite:///:memory:"
+        run: |
+          if [ -d tests ]; then
+            python -m pytest tests --cov=app --cov-report=xml:coverage.xml
+          else
+            echo "Pasta ./tests não encontrada."
+            exit 1
+          fi
+
+      - name: SonarCloud Scan
+        if: always()
+        uses: sonarsource/sonarcloud-github-action@v3
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN_GB4 }}
+        with:
+          projectBaseDir: .

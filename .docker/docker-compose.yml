@@ -1,0 +1,20 @@
+services:
+  video_upload_service:
+    build:
+      context: ./bin
+      dockerfile: Dockerfile
+    container_name: upload_service
+    ports:
+      - "${APP_PORT}:8080"
+    volumes:
+      - ../:/app
+    env_file:
+      - .env
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
+    networks:
+      - shared_net
+
+networks:
+  shared_net:
+    external: true
+    name: shared_net

@@ -2,7 +2,7 @@ FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
-COPY .docker/bin/config/requirements.txt ./requirements.txt
+COPY ./config/requirements.txt ./requirements.txt
 
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt

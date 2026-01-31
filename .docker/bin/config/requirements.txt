@@ -4,11 +4,10 @@ pydantic[email]
 sqlalchemy
 pytest
 pytest-bdd
+pytest-cov
 python-dotenv
 psycopg2-binary
 boto3
 alembic
 httpx
-pytest
 bleach
-pytest-cov

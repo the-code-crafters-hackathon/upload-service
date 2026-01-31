@@ -1,1 +1,1 @@
-print("lanchonete-app-producao package")
+print("upload_service package")

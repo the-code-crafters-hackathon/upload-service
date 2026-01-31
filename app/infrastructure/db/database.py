@@ -6,7 +6,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 
 def _build_db_url() -> str:
     direct = os.getenv("DATABASE_URL") or os.getenv("SQLALCHEMY_DATABASE_URL")
-    
+
     if direct:
         return direct
     

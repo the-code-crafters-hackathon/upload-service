@@ -1,6 +1,4 @@
-from .produto import Produto
-from .cliente import Cliente
-from .categoria_produto import CategoriaProduto
+from .video import Video
 
 
-__all__ = ["Produto", "Cliente", "CategoriaProduto"]
+__all__ = ["Video"]

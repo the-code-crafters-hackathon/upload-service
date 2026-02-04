@@ -86,7 +86,6 @@ jobs:
             --cli-input-json file://taskdef.rendered.json \
             --query 'taskDefinition.taskDefinitionArn' \
             --output text)
-          NEW_TASKDEF_ARN=$(aws ecs register-task-definition --cli-input-json file://taskdef.rendered.json --query 'taskDefinition.taskDefinitionArn' --output text)
 
           aws ecs update-service \
             --cluster "$ECS_CLUSTER_NAME" \

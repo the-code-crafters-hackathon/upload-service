@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -81,7 +82,10 @@ jobs:
                 .registeredBy
               )
           ' taskdef.json > taskdef.rendered.json
-
+          NEW_TASKDEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://taskdef.rendered.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
           NEW_TASKDEF_ARN=$(aws ecs register-task-definition --cli-input-json file://taskdef.rendered.json --query 'taskDefinition.taskDefinitionArn' --output text)
 
           aws ecs update-service \

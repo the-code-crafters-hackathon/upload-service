@@ -1,41 +1,14 @@
-name: CI/CD
+name: CD
 
 on:
-  pull_request:
   push:
+    branches:
+      - main
 
 jobs:
-  test:
-    name: Testes (unit)
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Instalar dependências
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r .docker/bin/config/requirements.txt
-
-      - name: Rodar testes unitários
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          pytest -q tests/unit
-
   deploy:
     name: Deploy (ECR + ECS)
     runs-on: ubuntu-latest
-    needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       id-token: write
       contents: read
@@ -43,6 +16,8 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
       AWS_IAM_ROLE_ARN: ${{ vars.AWS_IAM_ROLE_ARN }}
       ECS_CLUSTER_NAME: ${{ vars.ECS_CLUSTER_NAME || 'hackathon-cluster' }}
+      ECS_TASK_FAMILY: ${{ vars.ECS_TASK_FAMILY || 'hackathon-upload' }}
+      ECS_SERVICE_NAME: ${{ vars.ECS_SERVICE_NAME || 'hackathon-upload' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -79,32 +54,20 @@ jobs:
 
       - name: Deploy no ECS (se serviço existir)
         env:
-          REPO_NAME: ${{ github.event.repository.name }}
           IMAGE_URI: ${{ steps.image.outputs.IMAGE_URI }}
         run: |
-          case "$REPO_NAME" in
-            upload-service)
-              TASK_FAMILY="hackathon-upload"
-              SERVICE_NAME="hackathon-upload"
-              ;;
-            *)
-              echo "::error::Este workflow está preparado para upload-service; repo atual: $REPO_NAME"
-              exit 1
-              ;;
-          esac
-
           SERVICE_STATUS=$(aws ecs describe-services \
             --cluster "$ECS_CLUSTER_NAME" \
-            --services "$SERVICE_NAME" \
+            --services "$ECS_SERVICE_NAME" \
             --query 'services[0].status' \
             --output text 2>/dev/null || true)
 
           if [ "$SERVICE_STATUS" != "ACTIVE" ]; then
-            echo "Serviço ECS '$SERVICE_NAME' não está ACTIVE (status: $SERVICE_STATUS). Pulando deploy ECS."
+            echo "Serviço ECS '$ECS_SERVICE_NAME' não está ACTIVE (status: $SERVICE_STATUS). Pulando deploy ECS."
             exit 0
           fi
 
-          aws ecs describe-task-definition --task-definition "$TASK_FAMILY" --query taskDefinition > taskdef.json
+          aws ecs describe-task-definition --task-definition "$ECS_TASK_FAMILY" --query taskDefinition > taskdef.json
 
           jq --arg IMAGE "$IMAGE_URI" '
             .containerDefinitions |= (map(.image = $IMAGE))
@@ -123,8 +86,8 @@ jobs:
 
           aws ecs update-service \
             --cluster "$ECS_CLUSTER_NAME" \
-            --service "$SERVICE_NAME" \
+            --service "$ECS_SERVICE_NAME" \
             --task-definition "$NEW_TASKDEF_ARN" \
             --force-new-deployment
 
-          aws ecs wait services-stable --cluster "$ECS_CLUSTER_NAME" --services "$SERVICE_NAME"
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER_NAME" --services "$ECS_SERVICE_NAME"

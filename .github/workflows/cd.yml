@@ -176,6 +176,7 @@ jobs:
 
           jq --arg IMAGE "$IMAGE_URI" '
             .containerDefinitions |= (map(.image = $IMAGE))
+            | .containerDefinitions |= (map(del(.command)))
             | del(
                 .taskDefinitionArn,
                 .revision,
@@ -248,7 +249,7 @@ jobs:
             fi
 
             # Eventos do ECS com erros clássicos (fail-fast)
-            EVENT_MESSAGES=$(echo "$SVC_JSON" | jq -r '.services[0].events[0:10].message // empty')
+            EVENT_MESSAGES=$(echo "$SVC_JSON" | jq -r '.services[0].events[0:10][]?.message // empty')
             if echo "$EVENT_MESSAGES" | grep -Eqi 'unable to place a task|was unable to place a task|insufficient|RESOURCE:MEMORY|RESOURCE:CPU|CannotPullContainerError|no Fargate capacity|has stopped'; then
               echo "::error::ECS events indicam falha de agendamento/execução."
               echo "$EVENT_MESSAGES" | head -n 10
@@ -258,16 +259,20 @@ jobs:
             # ALB target health fail-fast (quando existir TG)
             TG_ARN=$(echo "$SVC_JSON" | jq -r '.services[0].loadBalancers[0].targetGroupArn // empty')
             if [ -n "${TG_ARN:-}" ]; then
-              TG_JSON=$(aws elbv2 describe-target-health --target-group-arn "$TG_ARN" --output json)
-              UNHEALTHY_COUNT=$(echo "$TG_JSON" | jq '[.TargetHealthDescriptions[] | select(.TargetHealth.State=="unhealthy")] | length')
-              if [ "$UNHEALTHY_COUNT" -gt 0 ]; then
-                echo "::error::Há ${UNHEALTHY_COUNT} target(s) unhealthy no Target Group."
-                echo "$TG_JSON" | jq '.TargetHealthDescriptions[] | select(.TargetHealth.State=="unhealthy")'
-                exit 1
+              TG_JSON=$(aws elbv2 describe-target-health --target-group-arn "$TG_ARN" --output json 2>/dev/null || true)
+              if [ -z "${TG_JSON:-}" ]; then
+                echo "Aviso: não foi possível consultar target health (sem permissão ou TG inválido)."
+              else
+                UNHEALTHY_COUNT=$(echo "$TG_JSON" | jq '[.TargetHealthDescriptions[] | select(.TargetHealth.State=="unhealthy")] | length')
+                if [ "$UNHEALTHY_COUNT" -gt 0 ]; then
+                  echo "::error::Há ${UNHEALTHY_COUNT} target(s) unhealthy no Target Group."
+                  echo "$TG_JSON" | jq '.TargetHealthDescriptions[] | select(.TargetHealth.State=="unhealthy")'
+                  exit 1
+                fi
               fi
             fi
 
-            # Tasks STOPPED com falha (exitCode != 0) desde o início do deploy
+            # Tasks STOPPED com falha (exitCode != 0) para a task definition recém-registrada
             STOPPED_TASKS=$(aws ecs list-tasks \
               --cluster "$ECS_CLUSTER_NAME" \
               --service-name "$ECS_SERVICE_NAME" \
@@ -281,18 +286,28 @@ jobs:
                 --tasks $STOPPED_TASKS \
                 --output json 2>/dev/null || true)
 
-              FAILED_STOPPED_COUNT=$(echo "$STOPPED_JSON" | jq --argjson start "$START_TS" '[.tasks[]
-                | select((.stoppedAt // "") != "")
-                | select((.stoppedAt | fromdateiso8601) >= $start)
-                | select(any(.containers[]?; ((.exitCode // 0) != 0)))
+              FAILED_STOPPED_COUNT=$(echo "$STOPPED_JSON" | jq --arg td "$NEW_TASKDEF_ARN" '[.tasks[]
+                | select(.taskDefinitionArn == $td)
+                | select(
+                    any(.containers[]?;
+                      ((.exitCode // 0) != 0)
+                      or ((.reason // "") | test("Cannot(Start|Pull)ContainerError"))
+                    )
+                    or ((.stoppedReason // "") | test("Cannot(Start|Pull)ContainerError"))
+                  )
               ] | length')
 
               if [ "$FAILED_STOPPED_COUNT" -gt 0 ]; then
-                echo "::error::Detectei ${FAILED_STOPPED_COUNT} task(s) STOPPED com exitCode != 0 desde o início do deploy."
-                echo "$STOPPED_JSON" | jq --argjson start "$START_TS" '.tasks[]
-                  | select((.stoppedAt // "") != "")
-                  | select((.stoppedAt | fromdateiso8601) >= $start)
-                  | select(any(.containers[]?; ((.exitCode // 0) != 0)))
+                echo "::error::Detectei ${FAILED_STOPPED_COUNT} task(s) STOPPED com falha para a task definition do deploy atual."
+                echo "$STOPPED_JSON" | jq --arg td "$NEW_TASKDEF_ARN" '.tasks[]
+                  | select(.taskDefinitionArn == $td)
+                  | select(
+                      any(.containers[]?;
+                        ((.exitCode // 0) != 0)
+                        or ((.reason // "") | test("Cannot(Start|Pull)ContainerError"))
+                      )
+                      or ((.stoppedReason // "") | test("Cannot(Start|Pull)ContainerError"))
+                    )
                   | {taskArn,stoppedAt,stoppedReason,stopCode,containers:[.containers[]? | {name,lastStatus,exitCode,reason}]}'
                 exit 1
               fi

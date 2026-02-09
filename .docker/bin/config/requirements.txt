@@ -11,3 +11,5 @@ boto3
 alembic
 httpx
 bleach
+python-multipart
+ffmpeg-python

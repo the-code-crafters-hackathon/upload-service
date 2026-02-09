@@ -145,22 +145,39 @@ jobs:
                 echo "Sem configuração awslogs (ou incompleta) na task definition; não consigo buscar logs automaticamente."
               else
                 STOPPED_JSON_RAW=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER_NAME" --tasks $STOPPED_TASKS --output json 2>/dev/null || true)
-                LATEST_STOPPED_ARN=$(echo "$STOPPED_JSON_RAW" | jq -r '.tasks
-                  | map(select(.stoppedAt != null))
-                  | sort_by(.stoppedAt)
-                  | last
-                  | .taskArn // empty')
 
-                if [ -z "${LATEST_STOPPED_ARN:-}" ]; then
-                  echo "Não encontrei task STOPPED com stoppedAt para buscar logs."
-                else
-                  TASK_ID="${LATEST_STOPPED_ARN##*/}"
-                  LOG_STREAM="${LOG_PREFIX}/${CONTAINER_NAME}/${TASK_ID}"
+                # Preferir sempre o log stream mais recente (evita depender de stoppedAt/taskId)
+                LATEST_STREAM=$(aws logs describe-log-streams \
+                  --log-group-name "$LOG_GROUP" \
+                  --log-stream-name-prefix "${LOG_PREFIX}/${CONTAINER_NAME}/" \
+                  --order-by LastEventTime \
+                  --descending \
+                  --max-items 1 \
+                  --query 'logStreams[0].logStreamName' \
+                  --output text 2>/dev/null || true)
+
+                if [ -z "${LATEST_STREAM:-}" ] || [ "${LATEST_STREAM:-}" = "None" ]; then
+                  # fallback: tenta montar stream pelo taskId da task mais recente (stoppedAt/createdAt/startedAt)
+                  LATEST_STOPPED_ARN=$(echo "$STOPPED_JSON_RAW" | jq -r '.tasks
+                    | map(select(.taskArn != null))
+                    | sort_by((.stoppedAt // .createdAt // .startedAt // "1970-01-01T00:00:00Z"))
+                    | last
+                    | .taskArn // empty')
+
+                  if [ -z "${LATEST_STOPPED_ARN:-}" ]; then
+                    echo "Não encontrei tasks para inferir log stream automaticamente."
+                  else
+                    TASK_ID="${LATEST_STOPPED_ARN##*/}"
+                    LATEST_STREAM="${LOG_PREFIX}/${CONTAINER_NAME}/${TASK_ID}"
+                  fi
+                fi
+
+                if [ -n "${LATEST_STREAM:-}" ] && [ "${LATEST_STREAM:-}" != "None" ]; then
                   echo "logGroup=${LOG_GROUP}"
-                  echo "logStream=${LOG_STREAM}"
+                  echo "logStream=${LATEST_STREAM}"
                   aws logs get-log-events \
                     --log-group-name "$LOG_GROUP" \
-                    --log-stream-name "$LOG_STREAM" \
+                    --log-stream-name "$LATEST_STREAM" \
                     --limit 50 \
                     --query 'events[*].message' \
                     --output text 2>/dev/null \
@@ -344,8 +361,8 @@ jobs:
                  end)
               | .[]?.message // empty
             ')
-            if echo "$NEW_EVENT_MESSAGES" | grep -Eqi 'unable to place a task|was unable to place a task|insufficient|RESOURCE:MEMORY|RESOURCE:CPU|CannotPullContainerError|no Fargate capacity|has stopped|CannotStartContainerError'; then
-              echo "::error::ECS events indicam falha de agendamento/execução."
+            if echo "$NEW_EVENT_MESSAGES" | grep -Eqi 'unable to place a task|was unable to place a task|insufficient|RESOURCE:MEMORY|RESOURCE:CPU|CannotPullContainerError|CannotStartContainerError|CannotCreateContainerError|ResourceInitializationError|no Fargate capacity'; then
+              echo "::error::ECS events indicam falha de agendamento/pull/start do container."
               echo "$NEW_EVENT_MESSAGES" | head -n 10
               exit 1
             fi

@@ -205,15 +205,21 @@ jobs:
               # tenta puxar logs do awslogs para a task STOPPED mais recente (preferindo a task definition do deploy atual)
               TASKDEF_FOR_LOGS="${NEW_TASKDEF_ARN:-$ECS_TASK_FAMILY}"
               STOPPED_JSON_RAW=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER_NAME" --tasks $STOPPED_TASKS --output json 2>/dev/null || true)
-              CANDIDATE_STOPPED_ARN=$(echo "$STOPPED_JSON_RAW" | jq -r --arg td "${NEW_TASKDEF_ARN:-}" '.tasks
-                | (if ($td != "") then map(select(.taskDefinitionArn == $td)) else . end)
+              CANDIDATE_STOPPED_ARN=$(echo "$STOPPED_JSON_RAW" | jq -r --arg td "${NEW_TASKDEF_ARN:-}" '
+                .tasks as $all
+                | (if ($td != "") then ($all | map(select(.taskDefinitionArn == $td))) else [] end) as $matches
+                | (if ($matches | length) > 0 then $matches else $all end)
                 | map(select(.taskArn != null))
                 | sort_by((.stoppedAt // .createdAt // .startedAt // "1970-01-01T00:00:00Z"))
                 | last
-                | .taskArn // empty')
+                | .taskArn // empty
+              ')
+
+              CANDIDATE_STOPPED_TD=$(echo "$STOPPED_JSON_RAW" | jq -r --arg arn "${CANDIDATE_STOPPED_ARN:-}" '.tasks[]? | select(.taskArn==$arn) | .taskDefinitionArn // empty' | head -n 1)
 
               if [ -n "${CANDIDATE_STOPPED_ARN:-}" ]; then
-                print_task_logs "$CANDIDATE_STOPPED_ARN" "$TASKDEF_FOR_LOGS"
+                # usa a task definition da própria task (mais confiável pra achar logConfiguration)
+                print_task_logs "$CANDIDATE_STOPPED_ARN" "${CANDIDATE_STOPPED_TD:-$TASKDEF_FOR_LOGS}"
               else
                 echo "::group::CloudWatch logs (últimas linhas - best effort)"
                 echo "Não encontrei task STOPPED candidata para buscar logs."
@@ -364,12 +370,6 @@ jobs:
               LAST_NEW_RUNNING="$NEW_RUNNING"
             fi
 
-            NO_PROGRESS_FOR=$((NOW_TS - LAST_PROGRESS_TS))
-            if [ "$NO_PROGRESS_FOR" -ge "$ECS_STABILIZE_NO_PROGRESS_SECONDS" ]; then
-              echo "::error::Sem progresso no rollout por ${NO_PROGRESS_FOR}s (limite ${ECS_STABILIZE_NO_PROGRESS_SECONDS}s)."
-              exit 1
-            fi
-
             if [ "$DESIRED" != "0" ] && [ "$RUNNING" = "0" ] && [ "$ELAPSED" -ge "$ECS_STABILIZE_NO_RUNNING_FAIL_SECONDS" ]; then
               echo "::error::Nenhuma task RUNNING após ${ELAPSED}s (limite ${ECS_STABILIZE_NO_RUNNING_FAIL_SECONDS}s)."
               exit 1
@@ -377,6 +377,12 @@ jobs:
 
             if [ "$DESIRED" != "0" ] && [ "$NEW_RUNNING" = "0" ] && [ "$ELAPSED" -ge "$ECS_STABILIZE_NO_NEW_TASK_RUNNING_SECONDS" ]; then
               echo "::error::Nenhuma task RUNNING na nova revisão (${NEW_TASKDEF_ARN}) após ${ELAPSED}s (limite ${ECS_STABILIZE_NO_NEW_TASK_RUNNING_SECONDS}s)."
+              exit 1
+            fi
+
+            NO_PROGRESS_FOR=$((NOW_TS - LAST_PROGRESS_TS))
+            if [ "$NO_PROGRESS_FOR" -ge "$ECS_STABILIZE_NO_PROGRESS_SECONDS" ]; then
+              echo "::error::Sem progresso no rollout por ${NO_PROGRESS_FOR}s (limite ${ECS_STABILIZE_NO_PROGRESS_SECONDS}s)."
               exit 1
             fi
 

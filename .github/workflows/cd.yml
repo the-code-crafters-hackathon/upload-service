@@ -28,6 +28,8 @@ jobs:
       ECS_STABILIZE_NO_PROGRESS_SECONDS: ${{ vars.ECS_STABILIZE_NO_PROGRESS_SECONDS || '90' }}
       # Falha se nenhuma task subir rapidamente (indicativo de incapacidade de agendar/puxar imagem/crash loop).
       ECS_STABILIZE_NO_RUNNING_FAIL_SECONDS: ${{ vars.ECS_STABILIZE_NO_RUNNING_FAIL_SECONDS || '90' }}
+      # Falha se nenhuma task da NOVA revisão ficar RUNNING rapidamente (evita ficar preso com task antiga).
+      ECS_STABILIZE_NO_NEW_TASK_RUNNING_SECONDS: ${{ vars.ECS_STABILIZE_NO_NEW_TASK_RUNNING_SECONDS || '120' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -222,6 +224,7 @@ jobs:
           LAST_RUNNING="-1"
           LAST_PENDING="-1"
           LAST_ROLLOUT=""
+          LAST_NEW_RUNNING="-1"
           while true; do
             NOW_TS=$(date +%s)
             ELAPSED=$((NOW_TS - START_TS))
@@ -239,14 +242,32 @@ jobs:
             DESIRED=$(echo "$SVC_JSON" | jq -r '.services[0].desiredCount')
             RUNNING=$(echo "$SVC_JSON" | jq -r '.services[0].runningCount')
             PENDING=$(echo "$SVC_JSON" | jq -r '.services[0].pendingCount')
-            echo "[${ELAPSED}s] rollout=${PRIMARY_ROLLOUT} desired=${DESIRED} running=${RUNNING} pending=${PENDING}"
+
+            # Quantas tasks RUNNING já estão usando a NOVA task definition?
+            NEW_RUNNING="0"
+            RUNNING_TASKS=$(aws ecs list-tasks \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --service-name "$ECS_SERVICE_NAME" \
+              --desired-status RUNNING \
+              --query 'taskArns' \
+              --output text 2>/dev/null || true)
+            if [ -n "${RUNNING_TASKS:-}" ]; then
+              RUNNING_JSON=$(aws ecs describe-tasks \
+                --cluster "$ECS_CLUSTER_NAME" \
+                --tasks $RUNNING_TASKS \
+                --output json 2>/dev/null || true)
+              NEW_RUNNING=$(echo "$RUNNING_JSON" | jq -r --arg td "$NEW_TASKDEF_ARN" '[.tasks[]? | select(.taskDefinitionArn == $td)] | length')
+            fi
+
+            echo "[${ELAPSED}s] rollout=${PRIMARY_ROLLOUT} desired=${DESIRED} running=${RUNNING} pending=${PENDING} new_running=${NEW_RUNNING}"
 
             # Progresso = qualquer mudança relevante
-            if [ "$RUNNING" != "$LAST_RUNNING" ] || [ "$PENDING" != "$LAST_PENDING" ] || [ "$PRIMARY_ROLLOUT" != "$LAST_ROLLOUT" ]; then
+            if [ "$RUNNING" != "$LAST_RUNNING" ] || [ "$PENDING" != "$LAST_PENDING" ] || [ "$PRIMARY_ROLLOUT" != "$LAST_ROLLOUT" ] || [ "$NEW_RUNNING" != "$LAST_NEW_RUNNING" ]; then
               LAST_PROGRESS_TS=$NOW_TS
               LAST_RUNNING="$RUNNING"
               LAST_PENDING="$PENDING"
               LAST_ROLLOUT="$PRIMARY_ROLLOUT"
+              LAST_NEW_RUNNING="$NEW_RUNNING"
             fi
 
             NO_PROGRESS_FOR=$((NOW_TS - LAST_PROGRESS_TS))
@@ -257,6 +278,11 @@ jobs:
 
             if [ "$DESIRED" != "0" ] && [ "$RUNNING" = "0" ] && [ "$ELAPSED" -ge "$ECS_STABILIZE_NO_RUNNING_FAIL_SECONDS" ]; then
               echo "::error::Nenhuma task RUNNING após ${ELAPSED}s (limite ${ECS_STABILIZE_NO_RUNNING_FAIL_SECONDS}s)."
+              exit 1
+            fi
+
+            if [ "$DESIRED" != "0" ] && [ "$NEW_RUNNING" = "0" ] && [ "$ELAPSED" -ge "$ECS_STABILIZE_NO_NEW_TASK_RUNNING_SECONDS" ]; then
+              echo "::error::Nenhuma task RUNNING na nova revisão (${NEW_TASKDEF_ARN}) após ${ELAPSED}s (limite ${ECS_STABILIZE_NO_NEW_TASK_RUNNING_SECONDS}s)."
               exit 1
             fi
 
@@ -339,7 +365,7 @@ jobs:
             fi
 
             # Considera estável quando o deployment PRIMARY completou e não há pendências.
-            if [ "$PRIMARY_ROLLOUT" = "COMPLETED" ] && [ "$PENDING" = "0" ] && [ "$RUNNING" = "$DESIRED" ]; then
+            if [ "$PRIMARY_ROLLOUT" = "COMPLETED" ] && [ "$PENDING" = "0" ] && [ "$RUNNING" = "$DESIRED" ] && [ "$NEW_RUNNING" != "0" ]; then
               echo "Serviço estabilizado."
               break
             fi

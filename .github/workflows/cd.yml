@@ -111,7 +111,7 @@ jobs:
               aws ecs describe-tasks \
                 --cluster "$ECS_CLUSTER_NAME" \
                 --tasks $RUNNING_TASKS \
-                --query 'tasks[*].{taskArn:taskArn,lastStatus:lastStatus,healthStatus:healthStatus,startedAt:startedAt,containers:containers[*].{name:name,lastStatus:lastStatus,exitCode:exitCode,reason:reason}}' \
+                --query 'tasks[*].{taskArn:taskArn,taskDefinitionArn:taskDefinitionArn,lastStatus:lastStatus,healthStatus:healthStatus,startedAt:startedAt,containers:containers[*].{name:name,lastStatus:lastStatus,exitCode:exitCode,reason:reason}}' \
                 --output json || true
             else
               echo "Nenhuma task RUNNING encontrada para o serviço."
@@ -129,8 +129,45 @@ jobs:
               aws ecs describe-tasks \
                 --cluster "$ECS_CLUSTER_NAME" \
                 --tasks $STOPPED_TASKS \
-                --query 'tasks[*].{taskArn:taskArn,stoppedReason:stoppedReason,stopCode:stopCode,stoppedAt:stoppedAt,containers:containers[*].{name:name,lastStatus:lastStatus,exitCode:exitCode,reason:reason}}' \
+                --query 'tasks[*].{taskArn:taskArn,taskDefinitionArn:taskDefinitionArn,stoppedReason:stoppedReason,stopCode:stopCode,stoppedAt:stoppedAt,containers:containers[*].{name:name,lastStatus:lastStatus,exitCode:exitCode,reason:reason}}' \
                 --output json || true
+
+              echo "::group::CloudWatch logs (últimas linhas - best effort)"
+              # tenta puxar logs do awslogs para a task STOPPED mais recente
+              TASKDEF_FOR_LOGS="${NEW_TASKDEF_ARN:-$ECS_TASK_FAMILY}"
+              TD_JSON=$(aws ecs describe-task-definition --task-definition "$TASKDEF_FOR_LOGS" --output json 2>/dev/null || true)
+              LOG_DRIVER=$(echo "$TD_JSON" | jq -r '.taskDefinition.containerDefinitions[0].logConfiguration.logDriver // empty')
+              LOG_GROUP=$(echo "$TD_JSON" | jq -r '.taskDefinition.containerDefinitions[0].logConfiguration.options["awslogs-group"] // empty')
+              LOG_PREFIX=$(echo "$TD_JSON" | jq -r '.taskDefinition.containerDefinitions[0].logConfiguration.options["awslogs-stream-prefix"] // empty')
+              CONTAINER_NAME=$(echo "$TD_JSON" | jq -r '.taskDefinition.containerDefinitions[0].name // empty')
+
+              if [ "$LOG_DRIVER" != "awslogs" ] || [ -z "${LOG_GROUP:-}" ] || [ -z "${LOG_PREFIX:-}" ] || [ -z "${CONTAINER_NAME:-}" ]; then
+                echo "Sem configuração awslogs (ou incompleta) na task definition; não consigo buscar logs automaticamente."
+              else
+                STOPPED_JSON_RAW=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER_NAME" --tasks $STOPPED_TASKS --output json 2>/dev/null || true)
+                LATEST_STOPPED_ARN=$(echo "$STOPPED_JSON_RAW" | jq -r '.tasks
+                  | map(select(.stoppedAt != null))
+                  | sort_by(.stoppedAt)
+                  | last
+                  | .taskArn // empty')
+
+                if [ -z "${LATEST_STOPPED_ARN:-}" ]; then
+                  echo "Não encontrei task STOPPED com stoppedAt para buscar logs."
+                else
+                  TASK_ID="${LATEST_STOPPED_ARN##*/}"
+                  LOG_STREAM="${LOG_PREFIX}/${CONTAINER_NAME}/${TASK_ID}"
+                  echo "logGroup=${LOG_GROUP}"
+                  echo "logStream=${LOG_STREAM}"
+                  aws logs get-log-events \
+                    --log-group-name "$LOG_GROUP" \
+                    --log-stream-name "$LOG_STREAM" \
+                    --limit 50 \
+                    --query 'events[*].message' \
+                    --output text 2>/dev/null \
+                    || echo "Não consegui ler logs (sem permissão logs:GetLogEvents/DescribeLogStreams ou stream inexistente ainda)."
+                fi
+              fi
+              echo "::endgroup::"
             else
               echo "Nenhuma task STOPPED encontrada para o serviço."
             fi

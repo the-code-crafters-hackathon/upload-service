@@ -32,3 +32,6 @@ alembic/versions/*.pyc
 
 # Logs
 *.log
+
+outputs/*
+uploads/*

@@ -71,6 +71,54 @@ def test_build_db_url_with_secret(monkeypatch):
             sys.modules.pop("sqlalchemy.orm", None)
 
 
+def test_build_db_url_with_db_secret_env(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("SQLALCHEMY_DATABASE_URL", raising=False)
+    monkeypatch.delenv("DB_SECRET_NAME", raising=False)
+
+    monkeypatch.setenv(
+        "DB_SECRET",
+        json.dumps(
+            {
+                "host": "db.local",
+                "port": 5432,
+                "username": "user",
+                "password": "pass",
+                "dbname": "mydb",
+            }
+        ),
+    )
+
+    import importlib, sys, types
+
+    orig_sqlalchemy = sys.modules.get("sqlalchemy")
+    orig_sqlalchemy_orm = sys.modules.get("sqlalchemy.orm")
+
+    try:
+        fake_sqlalchemy = types.ModuleType("sqlalchemy")
+        fake_sqlalchemy.create_engine = lambda url: None
+        sys.modules["sqlalchemy"] = fake_sqlalchemy
+
+        fake_sqlalchemy_orm = types.ModuleType("sqlalchemy.orm")
+        fake_sqlalchemy_orm.sessionmaker = lambda **kwargs: lambda: None
+        fake_sqlalchemy_orm.declarative_base = lambda: object
+        sys.modules["sqlalchemy.orm"] = fake_sqlalchemy_orm
+
+        mod = importlib.import_module("app.infrastructure.db.database")
+        url = mod._build_db_url()
+        assert url.startswith("postgresql://")
+        assert "user" in url and "pass" in url and "mydb" in url
+    finally:
+        if orig_sqlalchemy is not None:
+            sys.modules["sqlalchemy"] = orig_sqlalchemy
+        else:
+            sys.modules.pop("sqlalchemy", None)
+        if orig_sqlalchemy_orm is not None:
+            sys.modules["sqlalchemy.orm"] = orig_sqlalchemy_orm
+        else:
+            sys.modules.pop("sqlalchemy.orm", None)
+
+
 def test_build_db_url_secret_missing_fields(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("SQLALCHEMY_DATABASE_URL", raising=False)

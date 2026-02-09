@@ -73,6 +73,7 @@ jobs:
           print_task_logs() {
             local task_arn="$1"
             local taskdef_for_logs="${2:-${NEW_TASKDEF_ARN:-$ECS_TASK_FAMILY}}"
+            local log_limit="${ECS_LOG_TAIL_LINES:-200}"
 
             echo "::group::CloudWatch logs (últimas linhas - best effort)"
 
@@ -106,9 +107,9 @@ jobs:
             aws logs get-log-events \
               --log-group-name "$log_group" \
               --log-stream-name "$stream_name" \
-              --limit 50 \
-              --query 'events[*].message' \
-              --output text 2>/dev/null \
+              --limit "$log_limit" \
+              --output json 2>/dev/null \
+              | jq -r '.events[]?.message' \
               || {
                 # fallback: tenta o log stream mais recente do prefixo (quando task acabou de morrer e/ou stream não foi inferido)
                 local latest_stream
@@ -126,9 +127,9 @@ jobs:
                   aws logs get-log-events \
                     --log-group-name "$log_group" \
                     --log-stream-name "$latest_stream" \
-                    --limit 50 \
-                    --query 'events[*].message' \
-                    --output text 2>/dev/null \
+                    --limit "$log_limit" \
+                    --output json 2>/dev/null \
+                    | jq -r '.events[]?.message' \
                     || echo "Não consegui ler logs (sem permissão logs:GetLogEvents/DescribeLogStreams, stream inexistente, ou ainda sem eventos)."
                 else
                   echo "Não consegui ler logs (sem permissão logs:GetLogEvents/DescribeLogStreams, stream inexistente, ou ainda sem eventos)."

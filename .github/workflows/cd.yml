@@ -172,6 +172,16 @@ jobs:
             exit 0
           fi
 
+          # Captura o event id mais recente ANTES do deploy para filtrar eventos antigos
+          BASE_EVENT_ID=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER_NAME" \
+            --services "$ECS_SERVICE_NAME" \
+            --query 'services[0].events[0].id' \
+            --output text 2>/dev/null || true)
+          if [ "${BASE_EVENT_ID:-}" = "None" ]; then
+            BASE_EVENT_ID=""
+          fi
+
           aws ecs describe-task-definition --task-definition "$ECS_TASK_FAMILY" --query taskDefinition > taskdef.json
 
           jq --arg IMAGE "$IMAGE_URI" '
@@ -187,6 +197,13 @@ jobs:
                 .registeredBy
               )
           ' taskdef.json > taskdef.rendered.json
+
+          if jq -e '.containerDefinitions[] | select(has("command"))' taskdef.rendered.json >/dev/null; then
+            echo "::error::Sanity check falhou: task definition renderizada ainda contém 'command'."
+            jq '.containerDefinitions[] | {name, image, command, entryPoint}' taskdef.rendered.json || true
+            exit 1
+          fi
+
           NEW_TASKDEF_ARN=$(aws ecs register-task-definition \
             --cli-input-json file://taskdef.rendered.json \
             --query 'taskDefinition.taskDefinitionArn' \
@@ -249,10 +266,18 @@ jobs:
             fi
 
             # Eventos do ECS com erros clássicos (fail-fast)
-            EVENT_MESSAGES=$(echo "$SVC_JSON" | jq -r '.services[0].events[0:10][]?.message // empty')
-            if echo "$EVENT_MESSAGES" | grep -Eqi 'unable to place a task|was unable to place a task|insufficient|RESOURCE:MEMORY|RESOURCE:CPU|CannotPullContainerError|no Fargate capacity|has stopped'; then
+            NEW_EVENT_MESSAGES=$(echo "$SVC_JSON" | jq -r --arg base "$BASE_EVENT_ID" '
+              (.services[0].events // []) as $e
+              | ($e | map(.id) | index($base)) as $i
+              | (if ($base == "") then $e[0:10]
+                 elif ($i == null) then $e[0:10]
+                 else $e[0:$i]
+                 end)
+              | .[]?.message // empty
+            ')
+            if echo "$NEW_EVENT_MESSAGES" | grep -Eqi 'unable to place a task|was unable to place a task|insufficient|RESOURCE:MEMORY|RESOURCE:CPU|CannotPullContainerError|no Fargate capacity|has stopped|CannotStartContainerError'; then
               echo "::error::ECS events indicam falha de agendamento/execução."
-              echo "$EVENT_MESSAGES" | head -n 10
+              echo "$NEW_EVENT_MESSAGES" | head -n 10
               exit 1
             fi
 

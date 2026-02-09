@@ -180,9 +180,15 @@ jobs:
               --query 'services[0].loadBalancers[0].targetGroupArn' \
               --output text 2>/dev/null)
             if [ -n "${TG_ARN:-}" ] && [ "${TG_ARN:-}" != "None" ]; then
-              aws elbv2 describe-target-health \
+              TG_HEALTH_JSON=$(aws elbv2 describe-target-health \
                 --target-group-arn "$TG_ARN" \
-                --output json || true
+                --output json 2>/dev/null)
+
+              if [ -n "${TG_HEALTH_JSON:-}" ]; then
+                echo "$TG_HEALTH_JSON"
+              else
+                echo "Não foi possível consultar target health (sem permissão elasticloadbalancing:DescribeTargetHealth ou TG inválido)."
+              fi
             else
               echo "Serviço não parece estar associado a Target Group (loadBalancers[0].targetGroupArn vazio)."
             fi

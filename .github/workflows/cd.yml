@@ -68,7 +68,12 @@ jobs:
         run: |
           set -euo pipefail
 
+          DIAG_RAN=0
           diagnose() {
+            if [ "$DIAG_RAN" = "1" ]; then
+              return 0
+            fi
+            DIAG_RAN=1
             set +e
             echo "::group::ECS service (describe-services)"
             aws ecs describe-services \
@@ -145,7 +150,16 @@ jobs:
             echo "::endgroup::"
           }
 
+          on_exit() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              diagnose
+            fi
+          }
+
+          # ERR pega falhas de comandos; EXIT garante diagnóstico também em `exit 1`.
           trap diagnose ERR
+          trap on_exit EXIT
 
           SERVICE_STATUS=$(aws ecs describe-services \
             --cluster "$ECS_CLUSTER_NAME" \
@@ -293,4 +307,4 @@ jobs:
             sleep "$ECS_STABILIZE_POLL_SECONDS"
           done
 
-          trap - ERR
+          trap - ERR EXIT

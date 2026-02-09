@@ -10,6 +10,7 @@ jobs:
   deploy:
     name: Deploy (ECR + ECS)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       id-token: write
       contents: read
@@ -19,6 +20,14 @@ jobs:
       ECS_CLUSTER_NAME: ${{ vars.ECS_CLUSTER_NAME || 'hackathon-cluster' }}
       ECS_TASK_FAMILY: ${{ vars.ECS_TASK_FAMILY || 'hackathon-upload' }}
       ECS_SERVICE_NAME: ${{ vars.ECS_SERVICE_NAME || 'hackathon-upload' }}
+      # Fail-fast: tempo máximo para estabilizar o serviço antes de falhar o deploy.
+      # Pode sobrescrever via Settings → Actions → Variables.
+      ECS_STABILIZE_MAX_SECONDS: ${{ vars.ECS_STABILIZE_MAX_SECONDS || '300' }}
+      ECS_STABILIZE_POLL_SECONDS: ${{ vars.ECS_STABILIZE_POLL_SECONDS || '10' }}
+      # Falha se não houver mudança de estado (running/pending/rollout) por muito tempo.
+      ECS_STABILIZE_NO_PROGRESS_SECONDS: ${{ vars.ECS_STABILIZE_NO_PROGRESS_SECONDS || '90' }}
+      # Falha se nenhuma task subir rapidamente (indicativo de incapacidade de agendar/puxar imagem/crash loop).
+      ECS_STABILIZE_NO_RUNNING_FAIL_SECONDS: ${{ vars.ECS_STABILIZE_NO_RUNNING_FAIL_SECONDS || '90' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -57,6 +66,87 @@ jobs:
         env:
           IMAGE_URI: ${{ steps.image.outputs.IMAGE_URI }}
         run: |
+          set -euo pipefail
+
+          diagnose() {
+            set +e
+            echo "::group::ECS service (describe-services)"
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --services "$ECS_SERVICE_NAME" \
+              --output json || true
+            echo "::endgroup::"
+
+            echo "::group::ECS events (últimos 20)"
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --services "$ECS_SERVICE_NAME" \
+              --query 'services[0].events[0:20].[createdAt,message]' \
+              --output table || true
+            echo "::endgroup::"
+
+            echo "::group::ECS deployments"
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --services "$ECS_SERVICE_NAME" \
+              --query 'services[0].deployments[*].[status,rolloutState,desiredCount,runningCount,pendingCount,taskDefinition,createdAt,updatedAt]' \
+              --output table || true
+            echo "::endgroup::"
+
+            echo "::group::ECS tasks RUNNING"
+            RUNNING_TASKS=$(aws ecs list-tasks \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --service-name "$ECS_SERVICE_NAME" \
+              --desired-status RUNNING \
+              --query 'taskArns' \
+              --output text 2>/dev/null)
+            if [ -n "${RUNNING_TASKS:-}" ]; then
+              aws ecs describe-tasks \
+                --cluster "$ECS_CLUSTER_NAME" \
+                --tasks $RUNNING_TASKS \
+                --query 'tasks[*].{taskArn:taskArn,lastStatus:lastStatus,healthStatus:healthStatus,startedAt:startedAt,containers:containers[*].{name:name,lastStatus:lastStatus,exitCode:exitCode,reason:reason}}' \
+                --output json || true
+            else
+              echo "Nenhuma task RUNNING encontrada para o serviço."
+            fi
+            echo "::endgroup::"
+
+            echo "::group::ECS tasks STOPPED (recentes)"
+            STOPPED_TASKS=$(aws ecs list-tasks \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --service-name "$ECS_SERVICE_NAME" \
+              --desired-status STOPPED \
+              --query 'taskArns' \
+              --output text 2>/dev/null)
+            if [ -n "${STOPPED_TASKS:-}" ]; then
+              aws ecs describe-tasks \
+                --cluster "$ECS_CLUSTER_NAME" \
+                --tasks $STOPPED_TASKS \
+                --query 'tasks[*].{taskArn:taskArn,stoppedReason:stoppedReason,stopCode:stopCode,stoppedAt:stoppedAt,containers:containers[*].{name:name,lastStatus:lastStatus,exitCode:exitCode,reason:reason}}' \
+                --output json || true
+            else
+              echo "Nenhuma task STOPPED encontrada para o serviço."
+            fi
+            echo "::endgroup::"
+
+            echo "::group::ALB target group health (se houver)"
+            TG_ARN=$(aws ecs describe-services \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --services "$ECS_SERVICE_NAME" \
+              --query 'services[0].loadBalancers[0].targetGroupArn' \
+              --output text 2>/dev/null)
+            if [ -n "${TG_ARN:-}" ] && [ "${TG_ARN:-}" != "None" ]; then
+              aws elbv2 describe-target-health \
+                --target-group-arn "$TG_ARN" \
+                --output json || true
+            else
+              echo "Serviço não parece estar associado a Target Group (loadBalancers[0].targetGroupArn vazio)."
+            fi
+            echo "::endgroup::"
+          }
+
+          trap diagnose ERR
+
           SERVICE_STATUS=$(aws ecs describe-services \
             --cluster "$ECS_CLUSTER_NAME" \
             --services "$ECS_SERVICE_NAME" \
@@ -93,4 +183,114 @@ jobs:
             --task-definition "$NEW_TASKDEF_ARN" \
             --force-new-deployment
 
-          aws ecs wait services-stable --cluster "$ECS_CLUSTER_NAME" --services "$ECS_SERVICE_NAME"
+          echo "Aguardando estabilização (fail-fast): até ${ECS_STABILIZE_MAX_SECONDS}s, checando a cada ${ECS_STABILIZE_POLL_SECONDS}s"
+
+          START_TS=$(date +%s)
+          LAST_PROGRESS_TS=$START_TS
+          LAST_RUNNING="-1"
+          LAST_PENDING="-1"
+          LAST_ROLLOUT=""
+          while true; do
+            NOW_TS=$(date +%s)
+            ELAPSED=$((NOW_TS - START_TS))
+            if [ "$ELAPSED" -ge "$ECS_STABILIZE_MAX_SECONDS" ]; then
+              echo "::error::ECS não estabilizou em ${ECS_STABILIZE_MAX_SECONDS}s (fail-fast)."
+              exit 1
+            fi
+
+            SVC_JSON=$(aws ecs describe-services \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --services "$ECS_SERVICE_NAME" \
+              --output json)
+
+            PRIMARY_ROLLOUT=$(echo "$SVC_JSON" | jq -r '.services[0].deployments[] | select(.status=="PRIMARY") | .rolloutState')
+            DESIRED=$(echo "$SVC_JSON" | jq -r '.services[0].desiredCount')
+            RUNNING=$(echo "$SVC_JSON" | jq -r '.services[0].runningCount')
+            PENDING=$(echo "$SVC_JSON" | jq -r '.services[0].pendingCount')
+            echo "[${ELAPSED}s] rollout=${PRIMARY_ROLLOUT} desired=${DESIRED} running=${RUNNING} pending=${PENDING}"
+
+            # Progresso = qualquer mudança relevante
+            if [ "$RUNNING" != "$LAST_RUNNING" ] || [ "$PENDING" != "$LAST_PENDING" ] || [ "$PRIMARY_ROLLOUT" != "$LAST_ROLLOUT" ]; then
+              LAST_PROGRESS_TS=$NOW_TS
+              LAST_RUNNING="$RUNNING"
+              LAST_PENDING="$PENDING"
+              LAST_ROLLOUT="$PRIMARY_ROLLOUT"
+            fi
+
+            NO_PROGRESS_FOR=$((NOW_TS - LAST_PROGRESS_TS))
+            if [ "$NO_PROGRESS_FOR" -ge "$ECS_STABILIZE_NO_PROGRESS_SECONDS" ]; then
+              echo "::error::Sem progresso no rollout por ${NO_PROGRESS_FOR}s (limite ${ECS_STABILIZE_NO_PROGRESS_SECONDS}s)."
+              exit 1
+            fi
+
+            if [ "$DESIRED" != "0" ] && [ "$RUNNING" = "0" ] && [ "$ELAPSED" -ge "$ECS_STABILIZE_NO_RUNNING_FAIL_SECONDS" ]; then
+              echo "::error::Nenhuma task RUNNING após ${ELAPSED}s (limite ${ECS_STABILIZE_NO_RUNNING_FAIL_SECONDS}s)."
+              exit 1
+            fi
+
+            if [ "$PRIMARY_ROLLOUT" = "FAILED" ]; then
+              echo "::error::Rollout do deployment PRIMARY está FAILED."
+              exit 1
+            fi
+
+            # Eventos do ECS com erros clássicos (fail-fast)
+            EVENT_MESSAGES=$(echo "$SVC_JSON" | jq -r '.services[0].events[0:10].message // empty')
+            if echo "$EVENT_MESSAGES" | grep -Eqi 'unable to place a task|was unable to place a task|insufficient|RESOURCE:MEMORY|RESOURCE:CPU|CannotPullContainerError|no Fargate capacity|has stopped'; then
+              echo "::error::ECS events indicam falha de agendamento/execução."
+              echo "$EVENT_MESSAGES" | head -n 10
+              exit 1
+            fi
+
+            # ALB target health fail-fast (quando existir TG)
+            TG_ARN=$(echo "$SVC_JSON" | jq -r '.services[0].loadBalancers[0].targetGroupArn // empty')
+            if [ -n "${TG_ARN:-}" ]; then
+              TG_JSON=$(aws elbv2 describe-target-health --target-group-arn "$TG_ARN" --output json)
+              UNHEALTHY_COUNT=$(echo "$TG_JSON" | jq '[.TargetHealthDescriptions[] | select(.TargetHealth.State=="unhealthy")] | length')
+              if [ "$UNHEALTHY_COUNT" -gt 0 ]; then
+                echo "::error::Há ${UNHEALTHY_COUNT} target(s) unhealthy no Target Group."
+                echo "$TG_JSON" | jq '.TargetHealthDescriptions[] | select(.TargetHealth.State=="unhealthy")'
+                exit 1
+              fi
+            fi
+
+            # Tasks STOPPED com falha (exitCode != 0) desde o início do deploy
+            STOPPED_TASKS=$(aws ecs list-tasks \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --service-name "$ECS_SERVICE_NAME" \
+              --desired-status STOPPED \
+              --max-results 10 \
+              --query 'taskArns' \
+              --output text 2>/dev/null || true)
+            if [ -n "${STOPPED_TASKS:-}" ]; then
+              STOPPED_JSON=$(aws ecs describe-tasks \
+                --cluster "$ECS_CLUSTER_NAME" \
+                --tasks $STOPPED_TASKS \
+                --output json 2>/dev/null || true)
+
+              FAILED_STOPPED_COUNT=$(echo "$STOPPED_JSON" | jq --argjson start "$START_TS" '[.tasks[]
+                | select((.stoppedAt // "") != "")
+                | select((.stoppedAt | fromdateiso8601) >= $start)
+                | select(any(.containers[]?; ((.exitCode // 0) != 0)))
+              ] | length')
+
+              if [ "$FAILED_STOPPED_COUNT" -gt 0 ]; then
+                echo "::error::Detectei ${FAILED_STOPPED_COUNT} task(s) STOPPED com exitCode != 0 desde o início do deploy."
+                echo "$STOPPED_JSON" | jq --argjson start "$START_TS" '.tasks[]
+                  | select((.stoppedAt // "") != "")
+                  | select((.stoppedAt | fromdateiso8601) >= $start)
+                  | select(any(.containers[]?; ((.exitCode // 0) != 0)))
+                  | {taskArn,stoppedAt,stoppedReason,stopCode,containers:[.containers[]? | {name,lastStatus,exitCode,reason}]}'
+                exit 1
+              fi
+            fi
+
+            # Considera estável quando o deployment PRIMARY completou e não há pendências.
+            if [ "$PRIMARY_ROLLOUT" = "COMPLETED" ] && [ "$PENDING" = "0" ] && [ "$RUNNING" = "$DESIRED" ]; then
+              echo "Serviço estabilizado."
+              break
+            fi
+
+            sleep "$ECS_STABILIZE_POLL_SECONDS"
+          done
+
+          trap - ERR

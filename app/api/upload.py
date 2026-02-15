@@ -1,11 +1,11 @@
-from fastapi import APIRouter, File, UploadFile, Form, Depends, HTTPException, status, BackgroundTasks, Path
+from fastapi import APIRouter, File, UploadFile, Form, Depends, HTTPException, status, Path
 from pathlib import Path as PathlibPath
 
 from app.infrastructure.db.database import get_db
 from app.dao.video_dao import VideoDAO
 from app.gateways.video_processing_gateway import VideoProcessingGateway
+from app.gateways.sqs_producer import SQSProducer
 from app.use_cases.upload_use_case import UploadUseCase
-from app.use_cases.process_video_use_case import ProcessVideoUseCase
 from app.controllers.upload_controller import UploadController
 from app.controllers.list_videos_controller import ListVideosController, VideoListResponse
 from app.adapters.presenters.video_presenter import VideoResponse
@@ -22,14 +22,8 @@ def get_processing_gateway():
 
     return VideoProcessingGateway(base_dir=base_dir)
 
-
-def process_video_background(video_id: int, video_path: str, timestamp: str, db, processing_gateway):
-    video_dao = VideoDAO(db)
-    use_case = ProcessVideoUseCase(
-        processing_gateway=processing_gateway,
-        video_dao=video_dao
-    )
-    use_case.execute(video_id, video_path, timestamp)
+def get_sqs_producer():
+    return SQSProducer()
 
 
 @router.post("/video", response_model=VideoResponse, status_code=status.HTTP_201_CREATED, responses={
@@ -50,25 +44,16 @@ async def upload_and_process_video(
     file: UploadFile = File(...),
     db = Depends(get_db),
     processing_gateway: VideoProcessingGateway = Depends(get_processing_gateway),
-    background_tasks: BackgroundTasks = BackgroundTasks(),
+    sqs_producer: SQSProducer = Depends(get_sqs_producer),
 ):
     if not is_valid_video_file(file.filename):
         raise HTTPException(status_code=400, detail="Formato de arquivo não suportado")
 
     video_dao = VideoDAO(db)
-    use_case = UploadUseCase(processing_gateway=processing_gateway, video_dao=video_dao)
+    use_case = UploadUseCase(processing_gateway=processing_gateway, video_dao=video_dao, sqs_producer=sqs_producer)
     controller = UploadController(use_case)
 
-    response, (video_id, saved_path, timestamp) = controller.upload_video(user_id=user_id, title=title, upload_file=file)
-
-    background_tasks.add_task(
-        process_video_background,
-        video_id=video_id,
-        video_path=saved_path,
-        timestamp=timestamp,
-        db=db,
-        processing_gateway=processing_gateway
-    )
+    response = controller.upload_video(user_id=user_id, title=title, upload_file=file)
 
     return response
 

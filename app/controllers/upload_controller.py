@@ -18,4 +18,4 @@ class UploadController:
             status=created_video.status,
         )
 
-        return VideoResponse(status="success", data=response_data), (created_video.id, saved_path, timestamp)
+        return VideoResponse(status="success", data=response_data)

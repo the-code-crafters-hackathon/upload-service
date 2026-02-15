@@ -1,8 +1,10 @@
 from pathlib import Path
 from typing import List, Tuple
+import os
 import shutil
 import subprocess
 import zipfile
+import boto3
 from fastapi import UploadFile, HTTPException
 
 
@@ -20,56 +22,53 @@ class VideoProcessingGateway:
     def save_upload(self, upload_file: UploadFile, timestamp: str) -> Path:
         filename = f"{timestamp}_{upload_file.filename}"
         dest = self.uploads_dir / filename
-        try:
-            with open(dest, "wb") as buffer:
-                shutil.copyfileobj(upload_file.file, buffer)
-        finally:
-            upload_file.file.close()
 
-        return dest
+        env = os.getenv("APP_ENV", "development")
 
-    def _create_zip(self, files: List[Path], zip_path: Path) -> None:
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for f in files:
-                zipf.write(f, arcname=f.name)
-
-    def process_video(self, video_path: Path, timestamp: str, fps: int = 1) -> Tuple[Path, int, List[str]]:
-        proc_temp = self.temp_dir / timestamp
-        proc_temp.mkdir(parents=True, exist_ok=True)
-
-        frame_pattern = str(proc_temp / "frame_%04d.png")
-        cmd = [
-            "ffmpeg",
-            "-i",
-            str(video_path),
-            "-vf",
-            f"fps={fps}",
-            "-y",
-            frame_pattern,
-        ]
-
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
+        if env != "production":
             try:
-                shutil.rmtree(proc_temp)
+                with open(dest, "wb") as buffer:
+                    shutil.copyfileobj(upload_file.file, buffer)
+            finally:
+                upload_file.file.close()
+
+            return dest
+
+        bucket = os.getenv("AWS_S3_BUCKET")
+        if not bucket:
+            try:
+                upload_file.file.close()
             except Exception:
                 pass
-            raise HTTPException(status_code=500, detail=f"ffmpeg error: {result.stderr}")
+            raise HTTPException(status_code=500, detail="S3 bucket not configured")
 
-        frames = sorted(proc_temp.glob("*.png"))
-        if not frames:
-            shutil.rmtree(proc_temp)
-            raise HTTPException(status_code=500, detail="Nenhum frame extraído do vídeo")
-
-        zip_filename = f"frames_{timestamp}.zip"
-        zip_path = self.outputs_dir / zip_filename
-        self._create_zip(frames, zip_path)
-
-        image_names = [f.name for f in frames]
+        s3_key = f"uploads/{filename}"
 
         try:
-            shutil.rmtree(proc_temp)
+            s3_client = boto3.client(
+                "s3",
+                region_name=os.getenv("AWS_REGION"),
+                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+                endpoint_url=os.getenv("AWS_ENDPOINT_URL"),
+            )
+
+            try:
+                upload_file.file.seek(0)
+            except Exception:
+                pass
+
+            s3_client.upload_fileobj(upload_file.file, bucket, s3_key)
+        except Exception as e:
+            try:
+                upload_file.file.close()
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail=f"Erro ao enviar arquivo para S3: {e}")
+
+        try:
+            upload_file.file.close()
         except Exception:
             pass
 
-        return zip_path, len(frames), image_names
+        return f"s3://{bucket}/{s3_key}"

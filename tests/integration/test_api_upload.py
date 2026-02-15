@@ -96,8 +96,5 @@ class TestProcessingGatewayIntegration:
             gateway = VideoProcessingGateway(base_dir=Path(tmpdir))
 
             assert hasattr(gateway, 'save_upload')
-            assert hasattr(gateway, 'process_video')
-            assert hasattr(gateway, '_create_zip')
             assert callable(gateway.save_upload)
-            assert callable(gateway.process_video)
 

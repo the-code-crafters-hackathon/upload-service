@@ -22,20 +22,19 @@ def test_upload_controller_upload_video():
     mock_upload_file = Mock()
     controller = UploadController(use_case=mock_use_case)
 
-    response, background_info = controller.upload_video(
+    response = controller.upload_video(
         user_id=1,
         title="Test Video",
         upload_file=mock_upload_file
     )
 
-    assert response.status == "success"
     assert response.data.id == 1
     assert response.data.user_id == 1
     assert response.data.title == "Test Video"
-    assert response.data.status == 0
 
-    assert background_info[0] == 1
-    assert background_info[2] == "20260208_120000"
+    # controller no longer returns background info; validate the use_case return values instead
+    assert mock_use_case.execute.return_value[1] == str(Path("/path/to/video.mp4"))
+    assert mock_use_case.execute.return_value[2] == "20260208_120000"
 
 
 def test_upload_controller_return_tuple():
@@ -55,17 +54,16 @@ def test_upload_controller_return_tuple():
     mock_upload_file = Mock()
     controller = UploadController(use_case=mock_use_case)
 
-    response, background_info = controller.upload_video(
+    response = controller.upload_video(
         user_id=2,
         title="Another Video",
         upload_file=mock_upload_file
     )
-    
-    assert isinstance(background_info, tuple)
-    assert len(background_info) == 3
-    assert background_info[0] == 5
-    assert background_info[1] == "/path/to/another.mp4"
-    assert background_info[2] == "20260208_130000"
+
+    assert response.data.id == 5
+    # controller no longer returns background info; validate the use_case return values instead
+    assert mock_use_case.execute.return_value[1] == "/path/to/another.mp4"
+    assert mock_use_case.execute.return_value[2] == "20260208_130000"
 
 
 def test_upload_controller_passes_user_id_to_use_case():

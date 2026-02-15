@@ -9,6 +9,32 @@ def _build_db_url() -> str:
 
     if direct:
         return direct
+
+    injected_secret = os.getenv("DB_SECRET")
+    if injected_secret:
+        try:
+            # Permite também passar a URL direta via DB_SECRET.
+            if "://" in injected_secret:
+                return injected_secret
+
+            data = json.loads(injected_secret)
+
+            host = data.get("host")
+            port = data.get("port", 5432)
+            user = data.get("username") or data.get("user")
+            pwd = data.get("password")
+            dbname = data.get("dbname") or data.get("database")
+
+            if not all([host, user, pwd, dbname]):
+                raise ValueError("DB_SECRET missing required fields")
+
+            return f"postgresql://{quote_plus(str(user))}:{quote_plus(str(pwd))}@{host}:{port}/{dbname}"
+        except Exception as e:
+            raise RuntimeError(
+                "Database configuration error: could not build DB URL from DB_SECRET. "
+                "Set DATABASE_URL/SQLALCHEMY_DATABASE_URL, or provide a valid DB_SECRET (json with host/port/username/password/dbname), "
+                "or set DB_SECRET_NAME to fetch from Secrets Manager."
+            ) from e
     
     secret_name = os.getenv("DB_SECRET_NAME")
     if secret_name:
@@ -34,11 +60,11 @@ def _build_db_url() -> str:
 
             raise RuntimeError(
                 "Database configuration error: could not build DB URL from environment or Secrets Manager. "
-                "Set DATABASE_URL/SQLALCHEMY_DATABASE_URL or ensure DB_SECRET_NAME is readable and has host/port/username/password/dbname."
+                "Set DATABASE_URL/SQLALCHEMY_DATABASE_URL, or provide DB_SECRET, or ensure DB_SECRET_NAME is readable and has host/port/username/password/dbname."
             ) from e
 
     raise RuntimeError(
-        "Database configuration error: DATABASE_URL/SQLALCHEMY_DATABASE_URL not set and DB_SECRET_NAME not provided."
+        "Database configuration error: DATABASE_URL/SQLALCHEMY_DATABASE_URL not set and neither DB_SECRET nor DB_SECRET_NAME were provided."
     )
 
 engine = create_engine(_build_db_url())

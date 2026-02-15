@@ -1,0 +1,485 @@
+name: CD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy (ECR + ECS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      AWS_IAM_ROLE_ARN: ${{ vars.AWS_IAM_ROLE_ARN }}
+      ECS_CLUSTER_NAME: ${{ vars.ECS_CLUSTER_NAME || 'hackathon-cluster' }}
+      ECS_TASK_FAMILY: ${{ vars.ECS_TASK_FAMILY || 'hackathon-upload' }}
+      ECS_SERVICE_NAME: ${{ vars.ECS_SERVICE_NAME || 'hackathon-upload' }}
+      # Fail-fast: tempo máximo para estabilizar o serviço antes de falhar o deploy.
+      # Pode sobrescrever via Settings → Actions → Variables.
+      ECS_STABILIZE_MAX_SECONDS: ${{ vars.ECS_STABILIZE_MAX_SECONDS || '300' }}
+      ECS_STABILIZE_POLL_SECONDS: ${{ vars.ECS_STABILIZE_POLL_SECONDS || '10' }}
+      # Falha se não houver mudança de estado (running/pending/rollout) por muito tempo.
+      ECS_STABILIZE_NO_PROGRESS_SECONDS: ${{ vars.ECS_STABILIZE_NO_PROGRESS_SECONDS || '90' }}
+      # Falha se nenhuma task subir rapidamente (indicativo de incapacidade de agendar/puxar imagem/crash loop).
+      ECS_STABILIZE_NO_RUNNING_FAIL_SECONDS: ${{ vars.ECS_STABILIZE_NO_RUNNING_FAIL_SECONDS || '90' }}
+      # Falha se nenhuma task da NOVA revisão ficar RUNNING rapidamente (evita ficar preso com task antiga).
+      ECS_STABILIZE_NO_NEW_TASK_RUNNING_SECONDS: ${{ vars.ECS_STABILIZE_NO_NEW_TASK_RUNNING_SECONDS || '120' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validar variáveis obrigatórias
+        run: |
+          if [ -z "${AWS_IAM_ROLE_ARN}" ]; then
+            echo "::error::Variable AWS_IAM_ROLE_ARN não definida (Settings → Actions → Variables)."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_IAM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login no Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build e push da imagem
+        id: image
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          IMAGE_URI="${REGISTRY}/${REPO_NAME}:${GITHUB_SHA}"
+
+          echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+          docker build -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+
+      - name: Deploy no ECS (se serviço existir)
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.IMAGE_URI }}
+        run: |
+          set -euo pipefail
+
+          print_task_logs() {
+            local task_arn="$1"
+            local taskdef_for_logs="${2:-${NEW_TASKDEF_ARN:-$ECS_TASK_FAMILY}}"
+            local log_limit="${ECS_LOG_TAIL_LINES:-200}"
+
+            echo "::group::CloudWatch logs (últimas linhas - best effort)"
+
+            local td_json log_driver log_group log_prefix container_name
+            td_json=$(aws ecs describe-task-definition --task-definition "$taskdef_for_logs" --output json 2>/dev/null || true)
+            log_driver=$(echo "$td_json" | jq -r '.taskDefinition.containerDefinitions[0].logConfiguration.logDriver // empty')
+            log_group=$(echo "$td_json" | jq -r '.taskDefinition.containerDefinitions[0].logConfiguration.options["awslogs-group"] // empty')
+            log_prefix=$(echo "$td_json" | jq -r '.taskDefinition.containerDefinitions[0].logConfiguration.options["awslogs-stream-prefix"] // empty')
+            container_name=$(echo "$td_json" | jq -r '.taskDefinition.containerDefinitions[0].name // empty')
+
+            if [ "$log_driver" != "awslogs" ] || [ -z "${log_group:-}" ] || [ -z "${log_prefix:-}" ] || [ -z "${container_name:-}" ]; then
+              echo "Sem configuração awslogs (ou incompleta) na task definition; não consigo buscar logs automaticamente."
+              echo "::endgroup::"
+              return 0
+            fi
+
+            local task_json stream_name task_id
+            task_json=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER_NAME" --tasks "$task_arn" --output json 2>/dev/null || true)
+
+            # Melhor fonte: o ECS já devolve o logStreamName do container quando awslogs está habilitado
+            stream_name=$(echo "$task_json" | jq -r --arg c "$container_name" '.tasks[0].containers[]? | select(.name==$c) | .logStreamName // empty' | head -n 1)
+
+            if [ -z "${stream_name:-}" ]; then
+              task_id="${task_arn##*/}"
+              stream_name="${log_prefix}/${container_name}/${task_id}"
+            fi
+
+            echo "logGroup=${log_group}"
+            echo "logStream=${stream_name}"
+
+            aws logs get-log-events \
+              --log-group-name "$log_group" \
+              --log-stream-name "$stream_name" \
+              --limit "$log_limit" \
+              --output json 2>/dev/null \
+              | jq -r '.events[]?.message' \
+              || {
+                # fallback: tenta o log stream mais recente do prefixo (quando task acabou de morrer e/ou stream não foi inferido)
+                local latest_stream
+                latest_stream=$(aws logs describe-log-streams \
+                  --log-group-name "$log_group" \
+                  --log-stream-name-prefix "${log_prefix}/${container_name}/" \
+                  --order-by LastEventTime \
+                  --descending \
+                  --max-items 1 \
+                  --query 'logStreams[0].logStreamName' \
+                  --output text 2>/dev/null || true)
+
+                if [ -n "${latest_stream:-}" ] && [ "${latest_stream:-}" != "None" ]; then
+                  echo "Fallback para logStream mais recente: ${latest_stream}"
+                  aws logs get-log-events \
+                    --log-group-name "$log_group" \
+                    --log-stream-name "$latest_stream" \
+                    --limit "$log_limit" \
+                    --output json 2>/dev/null \
+                    | jq -r '.events[]?.message' \
+                    || echo "Não consegui ler logs (sem permissão logs:GetLogEvents/DescribeLogStreams, stream inexistente, ou ainda sem eventos)."
+                else
+                  echo "Não consegui ler logs (sem permissão logs:GetLogEvents/DescribeLogStreams, stream inexistente, ou ainda sem eventos)."
+                fi
+              }
+
+            echo "::endgroup::"
+            return 0
+          }
+
+          DIAG_RAN=0
+          diagnose() {
+            if [ "$DIAG_RAN" = "1" ]; then
+              return 0
+            fi
+            DIAG_RAN=1
+            set +e
+            echo "::group::ECS service (describe-services)"
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --services "$ECS_SERVICE_NAME" \
+              --output json || true
+            echo "::endgroup::"
+
+            echo "::group::ECS events (últimos 20)"
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --services "$ECS_SERVICE_NAME" \
+              --query 'services[0].events[0:20].[createdAt,message]' \
+              --output table || true
+            echo "::endgroup::"
+
+            echo "::group::ECS deployments"
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --services "$ECS_SERVICE_NAME" \
+              --query 'services[0].deployments[*].[status,rolloutState,desiredCount,runningCount,pendingCount,taskDefinition,createdAt,updatedAt]' \
+              --output table || true
+            echo "::endgroup::"
+
+            echo "::group::ECS tasks RUNNING"
+            RUNNING_TASKS=$(aws ecs list-tasks \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --service-name "$ECS_SERVICE_NAME" \
+              --desired-status RUNNING \
+              --query 'taskArns' \
+              --output text 2>/dev/null)
+            if [ -n "${RUNNING_TASKS:-}" ]; then
+              aws ecs describe-tasks \
+                --cluster "$ECS_CLUSTER_NAME" \
+                --tasks $RUNNING_TASKS \
+                --query 'tasks[*].{taskArn:taskArn,taskDefinitionArn:taskDefinitionArn,lastStatus:lastStatus,healthStatus:healthStatus,startedAt:startedAt,containers:containers[*].{name:name,lastStatus:lastStatus,exitCode:exitCode,reason:reason}}' \
+                --output json || true
+            else
+              echo "Nenhuma task RUNNING encontrada para o serviço."
+            fi
+            echo "::endgroup::"
+
+            echo "::group::ECS tasks STOPPED (recentes)"
+            STOPPED_TASKS=$(aws ecs list-tasks \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --service-name "$ECS_SERVICE_NAME" \
+              --desired-status STOPPED \
+              --query 'taskArns' \
+              --output text 2>/dev/null)
+            if [ -n "${STOPPED_TASKS:-}" ]; then
+              aws ecs describe-tasks \
+                --cluster "$ECS_CLUSTER_NAME" \
+                --tasks $STOPPED_TASKS \
+                --query 'tasks[*].{taskArn:taskArn,taskDefinitionArn:taskDefinitionArn,stoppedReason:stoppedReason,stopCode:stopCode,stoppedAt:stoppedAt,containers:containers[*].{name:name,lastStatus:lastStatus,exitCode:exitCode,reason:reason}}' \
+                --output json || true
+
+              # tenta puxar logs do awslogs para a task STOPPED mais recente (preferindo a task definition do deploy atual)
+              TASKDEF_FOR_LOGS="${NEW_TASKDEF_ARN:-$ECS_TASK_FAMILY}"
+              STOPPED_JSON_RAW=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER_NAME" --tasks $STOPPED_TASKS --output json 2>/dev/null || true)
+              CANDIDATE_STOPPED_ARN=$(echo "$STOPPED_JSON_RAW" | jq -r --arg td "${NEW_TASKDEF_ARN:-}" '
+                .tasks as $all
+                | (if ($td != "") then ($all | map(select(.taskDefinitionArn == $td))) else [] end) as $matches
+                | (if ($matches | length) > 0 then $matches else $all end)
+                | map(select(.taskArn != null))
+                | sort_by((.stoppedAt // .createdAt // .startedAt // "1970-01-01T00:00:00Z"))
+                | last
+                | .taskArn // empty
+              ')
+
+              CANDIDATE_STOPPED_TD=$(echo "$STOPPED_JSON_RAW" | jq -r --arg arn "${CANDIDATE_STOPPED_ARN:-}" '.tasks[]? | select(.taskArn==$arn) | .taskDefinitionArn // empty' | head -n 1)
+
+              if [ -n "${CANDIDATE_STOPPED_ARN:-}" ]; then
+                # usa a task definition da própria task (mais confiável pra achar logConfiguration)
+                print_task_logs "$CANDIDATE_STOPPED_ARN" "${CANDIDATE_STOPPED_TD:-$TASKDEF_FOR_LOGS}"
+              else
+                echo "::group::CloudWatch logs (últimas linhas - best effort)"
+                echo "Não encontrei task STOPPED candidata para buscar logs."
+                echo "::endgroup::"
+              fi
+            else
+              echo "Nenhuma task STOPPED encontrada para o serviço."
+            fi
+            echo "::endgroup::"
+
+            echo "::group::ALB target group health (se houver)"
+            TG_ARN=$(aws ecs describe-services \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --services "$ECS_SERVICE_NAME" \
+              --query 'services[0].loadBalancers[0].targetGroupArn' \
+              --output text 2>/dev/null)
+            if [ -n "${TG_ARN:-}" ] && [ "${TG_ARN:-}" != "None" ]; then
+              TG_HEALTH_JSON=$(aws elbv2 describe-target-health \
+                --target-group-arn "$TG_ARN" \
+                --output json 2>/dev/null)
+
+              if [ -n "${TG_HEALTH_JSON:-}" ]; then
+                echo "$TG_HEALTH_JSON"
+              else
+                echo "Não foi possível consultar target health (sem permissão elasticloadbalancing:DescribeTargetHealth ou TG inválido)."
+              fi
+            else
+              echo "Serviço não parece estar associado a Target Group (loadBalancers[0].targetGroupArn vazio)."
+            fi
+            echo "::endgroup::"
+          }
+
+          on_exit() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              diagnose
+            fi
+          }
+
+          # ERR pega falhas de comandos; EXIT garante diagnóstico também em `exit 1`.
+          trap diagnose ERR
+          trap on_exit EXIT
+
+          SERVICE_STATUS=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER_NAME" \
+            --services "$ECS_SERVICE_NAME" \
+            --query 'services[0].status' \
+            --output text 2>/dev/null || true)
+
+          if [ "$SERVICE_STATUS" != "ACTIVE" ]; then
+            echo "Serviço ECS '$ECS_SERVICE_NAME' não está ACTIVE (status: $SERVICE_STATUS). Pulando deploy ECS."
+            exit 0
+          fi
+
+          # Captura o event id mais recente ANTES do deploy para filtrar eventos antigos
+          BASE_EVENT_ID=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER_NAME" \
+            --services "$ECS_SERVICE_NAME" \
+            --query 'services[0].events[0].id' \
+            --output text 2>/dev/null || true)
+          if [ "${BASE_EVENT_ID:-}" = "None" ]; then
+            BASE_EVENT_ID=""
+          fi
+
+          aws ecs describe-task-definition --task-definition "$ECS_TASK_FAMILY" --query taskDefinition > taskdef.json
+
+          jq --arg IMAGE "$IMAGE_URI" '
+            .containerDefinitions |= (map(.image = $IMAGE))
+            | .containerDefinitions |= (map(del(.command)))
+            | del(
+                .taskDefinitionArn,
+                .revision,
+                .status,
+                .requiresAttributes,
+                .compatibilities,
+                .registeredAt,
+                .registeredBy
+              )
+          ' taskdef.json > taskdef.rendered.json
+
+          if jq -e '.containerDefinitions[] | select(has("command"))' taskdef.rendered.json >/dev/null; then
+            echo "::error::Sanity check falhou: task definition renderizada ainda contém 'command'."
+            jq '.containerDefinitions[] | {name, image, command, entryPoint}' taskdef.rendered.json || true
+            exit 1
+          fi
+
+          NEW_TASKDEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://taskdef.rendered.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER_NAME" \
+            --service "$ECS_SERVICE_NAME" \
+            --task-definition "$NEW_TASKDEF_ARN" \
+            --force-new-deployment
+
+          echo "Aguardando estabilização (fail-fast): até ${ECS_STABILIZE_MAX_SECONDS}s, checando a cada ${ECS_STABILIZE_POLL_SECONDS}s"
+
+          START_TS=$(date +%s)
+          LAST_PROGRESS_TS=$START_TS
+          LAST_RUNNING="-1"
+          LAST_PENDING="-1"
+          LAST_ROLLOUT=""
+          LAST_NEW_RUNNING="-1"
+          while true; do
+            NOW_TS=$(date +%s)
+            ELAPSED=$((NOW_TS - START_TS))
+            if [ "$ELAPSED" -ge "$ECS_STABILIZE_MAX_SECONDS" ]; then
+              echo "::error::ECS não estabilizou em ${ECS_STABILIZE_MAX_SECONDS}s (fail-fast)."
+              exit 1
+            fi
+
+            SVC_JSON=$(aws ecs describe-services \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --services "$ECS_SERVICE_NAME" \
+              --output json)
+
+            PRIMARY_ROLLOUT=$(echo "$SVC_JSON" | jq -r '.services[0].deployments[] | select(.status=="PRIMARY") | .rolloutState')
+            DESIRED=$(echo "$SVC_JSON" | jq -r '.services[0].desiredCount')
+            RUNNING=$(echo "$SVC_JSON" | jq -r '.services[0].runningCount')
+            PENDING=$(echo "$SVC_JSON" | jq -r '.services[0].pendingCount')
+
+            # Quantas tasks RUNNING já estão usando a NOVA task definition?
+            NEW_RUNNING="0"
+            RUNNING_TASKS=$(aws ecs list-tasks \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --service-name "$ECS_SERVICE_NAME" \
+              --desired-status RUNNING \
+              --query 'taskArns' \
+              --output text 2>/dev/null || true)
+            if [ -n "${RUNNING_TASKS:-}" ]; then
+              RUNNING_JSON=$(aws ecs describe-tasks \
+                --cluster "$ECS_CLUSTER_NAME" \
+                --tasks $RUNNING_TASKS \
+                --output json 2>/dev/null || true)
+              NEW_RUNNING=$(echo "$RUNNING_JSON" | jq -r --arg td "$NEW_TASKDEF_ARN" '[.tasks[]? | select(.taskDefinitionArn == $td)] | length')
+            fi
+
+            echo "[${ELAPSED}s] rollout=${PRIMARY_ROLLOUT} desired=${DESIRED} running=${RUNNING} pending=${PENDING} new_running=${NEW_RUNNING}"
+
+            # Progresso = qualquer mudança relevante
+            if [ "$RUNNING" != "$LAST_RUNNING" ] || [ "$PENDING" != "$LAST_PENDING" ] || [ "$PRIMARY_ROLLOUT" != "$LAST_ROLLOUT" ] || [ "$NEW_RUNNING" != "$LAST_NEW_RUNNING" ]; then
+              LAST_PROGRESS_TS=$NOW_TS
+              LAST_RUNNING="$RUNNING"
+              LAST_PENDING="$PENDING"
+              LAST_ROLLOUT="$PRIMARY_ROLLOUT"
+              LAST_NEW_RUNNING="$NEW_RUNNING"
+            fi
+
+            if [ "$DESIRED" != "0" ] && [ "$RUNNING" = "0" ] && [ "$ELAPSED" -ge "$ECS_STABILIZE_NO_RUNNING_FAIL_SECONDS" ]; then
+              echo "::error::Nenhuma task RUNNING após ${ELAPSED}s (limite ${ECS_STABILIZE_NO_RUNNING_FAIL_SECONDS}s)."
+              exit 1
+            fi
+
+            if [ "$DESIRED" != "0" ] && [ "$NEW_RUNNING" = "0" ] && [ "$ELAPSED" -ge "$ECS_STABILIZE_NO_NEW_TASK_RUNNING_SECONDS" ]; then
+              echo "::error::Nenhuma task RUNNING na nova revisão (${NEW_TASKDEF_ARN}) após ${ELAPSED}s (limite ${ECS_STABILIZE_NO_NEW_TASK_RUNNING_SECONDS}s)."
+              exit 1
+            fi
+
+            NO_PROGRESS_FOR=$((NOW_TS - LAST_PROGRESS_TS))
+            if [ "$NO_PROGRESS_FOR" -ge "$ECS_STABILIZE_NO_PROGRESS_SECONDS" ]; then
+              echo "::error::Sem progresso no rollout por ${NO_PROGRESS_FOR}s (limite ${ECS_STABILIZE_NO_PROGRESS_SECONDS}s)."
+              exit 1
+            fi
+
+            if [ "$PRIMARY_ROLLOUT" = "FAILED" ]; then
+              echo "::error::Rollout do deployment PRIMARY está FAILED."
+              exit 1
+            fi
+
+            # Eventos do ECS com erros clássicos (fail-fast)
+            NEW_EVENT_MESSAGES=$(echo "$SVC_JSON" | jq -r --arg base "$BASE_EVENT_ID" '
+              (.services[0].events // []) as $e
+              | ($e | map(.id) | index($base)) as $i
+              | (if ($base == "") then $e[0:10]
+                 elif ($i == null) then $e[0:10]
+                 else $e[0:$i]
+                 end)
+              | .[]?.message // empty
+            ')
+            if echo "$NEW_EVENT_MESSAGES" | grep -Eqi 'unable to place a task|was unable to place a task|insufficient|RESOURCE:MEMORY|RESOURCE:CPU|CannotPullContainerError|CannotStartContainerError|CannotCreateContainerError|ResourceInitializationError|no Fargate capacity'; then
+              echo "::error::ECS events indicam falha de agendamento/pull/start do container."
+              echo "$NEW_EVENT_MESSAGES" | head -n 10
+              exit 1
+            fi
+
+            # ALB target health fail-fast (quando existir TG)
+            TG_ARN=$(echo "$SVC_JSON" | jq -r '.services[0].loadBalancers[0].targetGroupArn // empty')
+            if [ -n "${TG_ARN:-}" ]; then
+              TG_JSON=$(aws elbv2 describe-target-health --target-group-arn "$TG_ARN" --output json 2>/dev/null || true)
+              if [ -z "${TG_JSON:-}" ]; then
+                echo "Aviso: não foi possível consultar target health (sem permissão ou TG inválido)."
+              else
+                UNHEALTHY_COUNT=$(echo "$TG_JSON" | jq '[.TargetHealthDescriptions[] | select(.TargetHealth.State=="unhealthy")] | length')
+                if [ "$UNHEALTHY_COUNT" -gt 0 ]; then
+                  echo "::error::Há ${UNHEALTHY_COUNT} target(s) unhealthy no Target Group."
+                  echo "$TG_JSON" | jq '.TargetHealthDescriptions[] | select(.TargetHealth.State=="unhealthy")'
+                  exit 1
+                fi
+              fi
+            fi
+
+            # Tasks STOPPED com falha (exitCode != 0) para a task definition recém-registrada
+            STOPPED_TASKS=$(aws ecs list-tasks \
+              --cluster "$ECS_CLUSTER_NAME" \
+              --service-name "$ECS_SERVICE_NAME" \
+              --desired-status STOPPED \
+              --max-results 10 \
+              --query 'taskArns' \
+              --output text 2>/dev/null || true)
+            if [ -n "${STOPPED_TASKS:-}" ]; then
+              STOPPED_JSON=$(aws ecs describe-tasks \
+                --cluster "$ECS_CLUSTER_NAME" \
+                --tasks $STOPPED_TASKS \
+                --output json 2>/dev/null || true)
+
+              FAILED_STOPPED_COUNT=$(echo "$STOPPED_JSON" | jq --arg td "$NEW_TASKDEF_ARN" '[.tasks[]
+                | select(.taskDefinitionArn == $td)
+                | select(
+                    any(.containers[]?;
+                      ((.exitCode // 0) != 0)
+                      or ((.reason // "") | test("Cannot(Start|Pull)ContainerError"))
+                    )
+                    or ((.stoppedReason // "") | test("Cannot(Start|Pull)ContainerError"))
+                  )
+              ] | length')
+
+              if [ "$FAILED_STOPPED_COUNT" -gt 0 ]; then
+                echo "::error::Detectei ${FAILED_STOPPED_COUNT} task(s) STOPPED com falha para a task definition do deploy atual."
+                echo "$STOPPED_JSON" | jq --arg td "$NEW_TASKDEF_ARN" '.tasks[]
+                  | select(.taskDefinitionArn == $td)
+                  | select(
+                      any(.containers[]?;
+                        ((.exitCode // 0) != 0)
+                        or ((.reason // "") | test("Cannot(Start|Pull)ContainerError"))
+                      )
+                      or ((.stoppedReason // "") | test("Cannot(Start|Pull)ContainerError"))
+                    )
+                  | {taskArn,stoppedAt,stoppedReason,stopCode,containers:[.containers[]? | {name,lastStatus,exitCode,reason}]}'
+
+                # best effort: já tenta imprimir logs da task que falhou antes de sair
+                FAILED_TASK_ARN=$(echo "$STOPPED_JSON" | jq -r --arg td "$NEW_TASKDEF_ARN" '.tasks[]
+                  | select(.taskDefinitionArn == $td)
+                  | select(any(.containers[]?; ((.exitCode // 0) != 0)))
+                  | .taskArn' | head -n 1)
+                if [ -n "${FAILED_TASK_ARN:-}" ]; then
+                  print_task_logs "$FAILED_TASK_ARN" "$NEW_TASKDEF_ARN" || true
+                fi
+                exit 1
+              fi
+            fi
+
+            # Considera estável quando o deployment PRIMARY completou e não há pendências.
+            if [ "$PRIMARY_ROLLOUT" = "COMPLETED" ] && [ "$PENDING" = "0" ] && [ "$RUNNING" = "$DESIRED" ] && [ "$NEW_RUNNING" != "0" ]; then
+              echo "Serviço estabilizado."
+              break
+            fi
+
+            sleep "$ECS_STABILIZE_POLL_SECONDS"
+          done
+
+          trap - ERR EXIT

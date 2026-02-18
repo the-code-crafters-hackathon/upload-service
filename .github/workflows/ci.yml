@@ -37,7 +37,7 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          pytest -q tests/unit --cov=app --cov-report=xml:coverage.xml
+          pytest -q tests/unit --cov=app --cov-config=.coveragerc --cov-report=xml:coverage.xml
 
       - name: Validar configuração do SonarCloud
         if: ${{ env.SONAR_TOKEN != '' }}

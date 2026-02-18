@@ -1,7 +1,7 @@
 import os
 import json
 from urllib.parse import quote_plus
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 def _build_db_url() -> str:
@@ -71,6 +71,28 @@ engine = create_engine(_build_db_url())
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
+
+
+def init_schema() -> None:
+    if engine.dialect.name == "postgresql":
+        create_video_table_sql = """
+        CREATE TABLE IF NOT EXISTS video(
+            id INT GENERATED ALWAYS AS IDENTITY,
+            user_id INT NULL,
+            title VARCHAR(255) NULL,
+            file_path VARCHAR(255) NULL,
+            status SMALLINT NULL,
+            PRIMARY KEY(id)
+        );
+        """
+
+        with engine.begin() as connection:
+            connection.execute(text(create_video_table_sql))
+        return
+
+    from app.models.video import Video
+
+    Base.metadata.create_all(bind=engine, tables=[Video.__table__])
 
 def get_db():
     db = SessionLocal()

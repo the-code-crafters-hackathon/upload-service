@@ -12,10 +12,29 @@ from app.adapters.presenters.video_presenter import VideoResponse
 
 router = APIRouter(prefix="/upload", tags=["upload"])
 
-def is_valid_video_file(filename: str) -> bool:
-    valid_extensions = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"}
+VALID_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"}
+VALID_VIDEO_CONTENT_TYPES = {
+    "video/mp4",
+    "video/x-msvideo",
+    "video/quicktime",
+    "video/x-matroska",
+    "video/x-ms-wmv",
+    "video/x-flv",
+    "video/webm",
+}
 
-    return PathlibPath(filename).suffix.lower() in valid_extensions
+
+def is_valid_video_file(filename: str) -> bool:
+    return PathlibPath(filename).suffix.lower() in VALID_VIDEO_EXTENSIONS
+
+
+def is_valid_video_content_type(content_type: str | None) -> bool:
+    if not content_type:
+        return False
+
+    normalized_type = content_type.split(";", 1)[0].strip().lower()
+
+    return normalized_type in VALID_VIDEO_CONTENT_TYPES
 
 def get_processing_gateway():
     base_dir = PathlibPath(__file__).resolve().parents[2]
@@ -46,7 +65,7 @@ async def upload_and_process_video(
     processing_gateway: VideoProcessingGateway = Depends(get_processing_gateway),
     sqs_producer: SQSProducer = Depends(get_sqs_producer),
 ):
-    if not is_valid_video_file(file.filename):
+    if not is_valid_video_file(file.filename) or not is_valid_video_content_type(file.content_type):
         raise HTTPException(status_code=400, detail="Formato de arquivo não suportado")
 
     video_dao = VideoDAO(db)

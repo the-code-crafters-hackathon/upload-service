@@ -2,7 +2,7 @@ import pytest
 from unittest.mock import Mock, patch, MagicMock
 from pathlib import Path
 
-from app.api.upload import is_valid_video_file
+from app.api.upload import is_valid_video_file, is_valid_video_content_type
 
 
 class TestVideoValidation:
@@ -31,3 +31,28 @@ class TestVideoValidation:
 
     def test_no_extension(self):
         assert is_valid_video_file("videofile") is False
+
+
+class TestVideoContentTypeValidation:
+    def test_valid_content_types(self):
+        valid_types = [
+            "video/mp4",
+            "video/x-msvideo",
+            "video/quicktime",
+            "video/x-matroska",
+            "video/x-ms-wmv",
+            "video/x-flv",
+            "video/webm",
+        ]
+
+        for content_type in valid_types:
+            assert is_valid_video_content_type(content_type) is True
+
+    def test_content_type_with_parameters(self):
+        assert is_valid_video_content_type("video/mp4; charset=binary") is True
+
+    def test_invalid_content_types(self):
+        invalid_types = ["text/plain", "application/json", "image/png", "application/octet-stream", None, ""]
+
+        for content_type in invalid_types:
+            assert is_valid_video_content_type(content_type) is False

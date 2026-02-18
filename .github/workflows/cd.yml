@@ -483,3 +483,17 @@ jobs:
           done
 
           trap - ERR EXIT
+
+      - name: Smoke test funcional de upload (pós-deploy)
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ECS_CLUSTER_NAME: ${{ env.ECS_CLUSTER_NAME }}
+          ECS_SERVICE_NAME: ${{ env.ECS_SERVICE_NAME }}
+          ALB_NAME: ${{ vars.SMOKE_ALB_NAME || 'hackathon-alb' }}
+          ALB_DNS: ${{ vars.SMOKE_ALB_DNS }}
+          UPLOAD_USER_ID: ${{ vars.SMOKE_UPLOAD_USER_ID || '1' }}
+          UPLOAD_TITLE: cd-smoke-video
+          EXPECT_VALID_STATUS: ${{ vars.SMOKE_EXPECT_VALID_STATUS || '201' }}
+        run: |
+          chmod +x tests/smoke/smoke-upload.sh
+          tests/smoke/smoke-upload.sh

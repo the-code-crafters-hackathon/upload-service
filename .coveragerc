@@ -1,0 +1,10 @@
+[run]
+source = app
+relative_files = True
+branch = True
+
+[paths]
+source =
+    app
+    /github/workspace/app
+    /home/runner/work/upload-service/upload-service/app

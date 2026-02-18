@@ -21,8 +21,15 @@ O **Video Upload & Processing Service** é um sistema que permite aos usuários:
 2. ✅ **Clean Architecture** - Separação clara entre Controller, UseCase, Gateway, Models e DAO
 3. ✅ **Processamento de múltiplos vídeos simultâneos** usando `BackgroundTasks` do FastAPI
 4. ✅ **Listagem de status dos vídeos** por usuário
-5. ✅ **80%+ cobertura de testes unitários** (37 testes passando)
+5. ✅ **80%+ cobertura de testes unitários** (**44 testes passando / 87% cobertura**)
 6. ✅ **FFmpeg integrado** ao Docker para processamento
+
+### ✅ Atualizações recentes (fev/2026)
+
+- Cobertura unitária atual: **87%** (`pytest --cov=app`)
+- Suíte unitária: **44 testes passando**
+- SonarCloud atualizado para **`sonar.projectVersion=0.2.0`**
+- Upload em produção validado com `file_path` em `s3://...` (quando `APP_ENV=production` e `AWS_S3_BUCKET` definido)
 
 ---
 
@@ -356,7 +363,7 @@ cd /var/www/html/pos/hackthon/upload-service
 pytest tests/unit/ -v
 
 # Com cobertura
-pytest tests/unit/ --cov=app --cov-report=html
+DATABASE_URL=sqlite:///./coverage.db pytest tests/unit/ --cov=app --cov-report=term --cov-report=xml:coverage.xml
 
 # Testes específicos
 pytest tests/unit/test_video_dao.py -v
@@ -371,16 +378,25 @@ pytest tests/integration/ -v
 
 ### Cobertura
 
-**37 testes passando ✅** com ~80%+ de cobertura:
+**44 testes passando ✅** com **87% de cobertura**:
 
-- ✅ 5 testes de VideoDAO
-- ✅ 2 testes de UploadUseCase
-- ✅ 3 testes de ProcessVideoUseCase
-- ✅ 3 testes de UploadController
-- ✅ 4 testes de ListVideosController
-- ✅ 6 testes de VideoProcessingGateway
-- ✅ 6 testes de validação de API
-- ✅ 7 testes de integração
+- ✅ Cobertura total do pacote `app`: **87%**
+- ✅ Relatório Sonar/CI gerado em `coverage.xml`
+- ✅ Meta mínima de cobertura (**80%**) atendida
+
+### SonarCloud
+
+Configuração no arquivo `sonar-project.properties`:
+
+- `sonar.projectKey=the-code-crafters-hackathon_upload-service`
+- `sonar.projectVersion=0.2.0`
+- `sonar.python.coverage.reportPaths=coverage.xml`
+
+Fluxo recomendado antes do scan:
+
+```bash
+DATABASE_URL=sqlite:///./coverage.db pytest tests/unit/ --cov=app --cov-report=xml:coverage.xml
+```
 
 ---
 

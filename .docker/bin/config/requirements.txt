@@ -13,3 +13,4 @@ httpx
 bleach
 python-multipart
 ffmpeg-python
+PyJWT[crypto]

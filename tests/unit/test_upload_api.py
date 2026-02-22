@@ -78,6 +78,12 @@ class TestVideoSizeValidation:
         monkeypatch.setenv("MAX_UPLOAD_SIZE_MB", "abc")
         assert get_max_upload_size_bytes() == DEFAULT_MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
+    def test_get_max_upload_size_bytes_zero_negative(self, monkeypatch):
+        monkeypatch.setenv("MAX_UPLOAD_SIZE_MB", "0")
+        assert get_max_upload_size_bytes() == DEFAULT_MAX_UPLOAD_SIZE_MB * 1024 * 1024
+        monkeypatch.setenv("MAX_UPLOAD_SIZE_MB", "-5")
+        assert get_max_upload_size_bytes() == DEFAULT_MAX_UPLOAD_SIZE_MB * 1024 * 1024
+
     def test_is_valid_video_size_true(self):
         upload_file = Mock()
         upload_file.file = io.BytesIO(b"a" * 1024)
@@ -89,3 +95,14 @@ class TestVideoSizeValidation:
         upload_file.file = io.BytesIO(b"a" * 4096)
 
         assert is_valid_video_size(upload_file, max_size_bytes=1024) is False
+
+    def test_is_valid_video_size_exception(self):
+        upload_file = Mock()
+        class BrokenStream:
+            def tell(self):
+                raise Exception("fail")
+            def seek(self, *args):
+                raise Exception("fail")
+        upload_file.file = BrokenStream()
+        # Deve retornar True em caso de erro
+        assert is_valid_video_size(upload_file, max_size_bytes=1024) is True

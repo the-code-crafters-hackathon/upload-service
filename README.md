@@ -31,7 +31,8 @@ O **Video Upload & Processing Service** é um sistema que permite aos usuários:
 - SonarCloud atualizado para **`sonar.projectVersion=0.2.0`**
 - Upload em produção validado com `file_path` em `s3://...` (quando `APP_ENV=production` e `AWS_S3_BUCKET` definido)
 - Smoke local do upload disponível em `tests/smoke/smoke-upload-ci-local.sh`
-- Smoke E2E global (Upload -> Worker) centralizado no repositório `infra`
+- Smoke legado local (sem JWT) disponível em `tests/smoke/smoke-e2e-upload-worker.sh`
+- Smoke E2E oficial com autenticação (evidência do projeto) em `infra/scripts/smoke-e2e-auth-full-flow.sh`
 
 ---
 

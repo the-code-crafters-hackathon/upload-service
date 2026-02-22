@@ -9,6 +9,7 @@ from app.use_cases.upload_use_case import UploadUseCase
 from app.controllers.upload_controller import UploadController
 from app.controllers.list_videos_controller import ListVideosController, VideoListResponse
 from app.adapters.presenters.video_presenter import VideoResponse
+from app.infrastructure.security.auth import get_current_user, enforce_same_user, AuthenticatedUser
 
 router = APIRouter(prefix="/upload", tags=["upload"])
 
@@ -64,7 +65,10 @@ async def upload_and_process_video(
     db = Depends(get_db),
     processing_gateway: VideoProcessingGateway = Depends(get_processing_gateway),
     sqs_producer: SQSProducer = Depends(get_sqs_producer),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ):
+    enforce_same_user(user_id, current_user)
+
     if not is_valid_video_file(file.filename) or not is_valid_video_content_type(file.content_type):
         raise HTTPException(status_code=400, detail="Formato de arquivo não suportado")
 
@@ -80,8 +84,11 @@ async def upload_and_process_video(
 async def list_user_videos(
     user_id: int = Path(..., description="ID do usuário"),
     db = Depends(get_db),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ):
     try:
+        enforce_same_user(user_id, current_user)
+
         video_dao = VideoDAO(db)
         controller = ListVideosController(video_dao)
         

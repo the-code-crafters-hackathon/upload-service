@@ -1,3 +1,5 @@
+import os
+
 from fastapi import APIRouter, File, UploadFile, Form, Depends, HTTPException, status, Path
 from pathlib import Path as PathlibPath
 
@@ -23,6 +25,7 @@ VALID_VIDEO_CONTENT_TYPES = {
     "video/x-flv",
     "video/webm",
 }
+DEFAULT_MAX_UPLOAD_SIZE_MB = 100
 
 
 def is_valid_video_file(filename: str) -> bool:
@@ -36,6 +39,32 @@ def is_valid_video_content_type(content_type: str | None) -> bool:
     normalized_type = content_type.split(";", 1)[0].strip().lower()
 
     return normalized_type in VALID_VIDEO_CONTENT_TYPES
+
+
+def get_max_upload_size_bytes() -> int:
+    raw_value = os.getenv("MAX_UPLOAD_SIZE_MB", str(DEFAULT_MAX_UPLOAD_SIZE_MB))
+    try:
+        max_mb = int(raw_value)
+        if max_mb <= 0:
+            raise ValueError()
+        return max_mb * 1024 * 1024
+    except (ValueError, TypeError):
+        return DEFAULT_MAX_UPLOAD_SIZE_MB * 1024 * 1024
+
+
+def is_valid_video_size(upload_file: UploadFile, max_size_bytes: int) -> bool:
+    file_stream = getattr(upload_file, "file", None)
+    if file_stream is None:
+        return True
+
+    try:
+        current_position = file_stream.tell()
+        file_stream.seek(0, 2)
+        file_size = file_stream.tell()
+        file_stream.seek(current_position)
+        return file_size <= max_size_bytes
+    except Exception:
+        return True
 
 def get_processing_gateway():
     base_dir = PathlibPath(__file__).resolve().parents[2]
@@ -71,6 +100,14 @@ async def upload_and_process_video(
 
     if not is_valid_video_file(file.filename) or not is_valid_video_content_type(file.content_type):
         raise HTTPException(status_code=400, detail="Formato de arquivo não suportado")
+
+    max_size_bytes = get_max_upload_size_bytes()
+    if not is_valid_video_size(file, max_size_bytes):
+        max_size_mb = max_size_bytes // (1024 * 1024)
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Arquivo excede o limite de {max_size_mb}MB",
+        )
 
     video_dao = VideoDAO(db)
     use_case = UploadUseCase(processing_gateway=processing_gateway, video_dao=video_dao, sqs_producer=sqs_producer)

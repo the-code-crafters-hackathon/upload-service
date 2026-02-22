@@ -281,6 +281,8 @@ brew install ffmpeg          # macOS
 export DATABASE_URL="postgresql://user:pass@localhost/dbname"
 # ou usar:
 export SQLALCHEMY_DATABASE_URL="sqlite:///./test.db"
+# Limite máximo de upload em MB (opcional; padrão: 100)
+export MAX_UPLOAD_SIZE_MB="100"
 
 # Rodar aplicação
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000

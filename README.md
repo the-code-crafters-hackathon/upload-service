@@ -19,7 +19,7 @@ O **Video Upload & Processing Service** é um sistema que permite aos usuários:
 
 1. ✅ **Adaptar funcionalidade de `projeto-fiapx/up.py`** para a arquitetura do `upload-service`
 2. ✅ **Clean Architecture** - Separação clara entre Controller, UseCase, Gateway, Models e DAO
-3. ✅ **Processamento de múltiplos vídeos simultâneos** usando `BackgroundTasks` do FastAPI
+3. ✅ **Processamento de múltiplos vídeos simultâneos** com publicação em fila SQS + consumo pelo `worker-service`
 4. ✅ **Listagem de status dos vídeos** por usuário
 5. ✅ **80%+ cobertura de testes unitários** (**44 testes passando / 87% cobertura**)
 6. ✅ **FFmpeg integrado** ao Docker para processamento
@@ -38,136 +38,50 @@ O **Video Upload & Processing Service** é um sistema que permite aos usuários:
 
 ## 🏗️ Arquitetura
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         CLIENTE (Postman)                        │
-└────────────────────┬────────────────────────────────────────────┘
-                     │
-                     ▼
-        ┌────────────────────────────┐
-        │   FastAPI Application      │
-        │  (app/infrastructure/api)  │
-        └────────┬───────────────────┘
-                 │
-        ┌────────▼─────────────────────┐
-        │    API Routes                │
-        │  (app/api/upload.py)         │
-        │  POST /upload/video          │
-        │  GET  /upload/videos/{uid}   │
-        └────┬──────────────────────────┘
-             │
-    ┌────────┴──────────────┬─────────────┐
-    │                       │             │
-    ▼                       ▼             ▼
-┌─────────────┐    ┌──────────────┐  ┌──────────┐
-│ Controllers │    │  Use Cases   │  │ Gateways │
-├─────────────┤    ├──────────────┤  ├──────────┤
-│ Upload      │    │ Upload       │  │ Video    │
-│ Controller  │───▶│ UseCase      │ │ Gateway  │
-│             │    │              │  │ (DB)     │
-│ List Videos │    │ Process      │  │          │
-│ Controller  │───▶│ Video        │  │ Video    │
-│             │    │ UseCase      │  │ Processing
-└─────────────┘    │              │  │ Gateway  │
-                   │              │  │ (Files)  │
-                   └──────────────┘  └──────────┘
-                        │                 │
-         ┌──────────────┴─────────────────┘
-         │
-         ▼
-    ┌─────────────────┐
-    │  DAOs           │
-    ├─────────────────┤
-    │ VideoDAO        │
-    │ - create_video()│
-    │ - update_status │
-    │ - list_by_user()│
-    └────────┬────────┘
-             │
-             ▼
-    ┌─────────────────┐
-    │  Database       │
-    │  (PostgreSQL)   │
-    │  Table: video   │
-    │  ├─ id (PK)     │
-    │  ├─ user_id (FK)│
-    │  ├─ title       │
-    │  ├─ file_path   │
-    │  └─ status      │
-    └─────────────────┘
+O `upload-service` segue uma variação de Clean Architecture e tem responsabilidade de **ingestão do vídeo** + **orquestração do processamento assíncrono**.
 
-    File System:
-    ├─ uploads/          (vídeos enviados)
-    ├─ temp/             (frames durante processamento)
-    └─ outputs/          (arquivos ZIP finais)
-```
+- Camada HTTP (`app/api`) expõe endpoints e valida request
+- Controllers (`app/controllers`) montam respostas e delegam regras
+- Use case (`app/use_cases/upload_use_case.py`) executa o caso de uso de upload
+- Gateways (`app/gateways`) fazem I/O externo (filesystem/S3 e SQS)
+- DAO (`app/dao/video_dao.py`) persiste e consulta dados
+- Infra (`app/infrastructure`) concentra bootstrap do FastAPI, DB e autenticação
 
-### 🔄 Fluxo de Processamento
+### 🔌 Diagrama de dependências (upload)
 
 ```
-1. UPLOAD (Síncrono)
-   ┌─────────────────────────────────────────┐
-   │ Usuário envia vídeo via POST             │
-   └────────────────┬────────────────────────┘
-                    │
-                    ▼
-   ┌─────────────────────────────────────────┐
-   │ Validar extensão (.mp4, .avi, etc)      │
-   └────────────────┬────────────────────────┘
-                    │
-                    ▼
-   ┌─────────────────────────────────────────┐
-   │ Salvar arquivo em /uploads               │
-   └────────────────┬────────────────────────┘
-                    │
-                    ▼
-   ┌─────────────────────────────────────────┐
-   │ Registrar no banco (status=0: processando)
-   └────────────────┬────────────────────────┘
-                    │
-                    ▼
-   ┌─────────────────────────────────────────┐
-   │ Retornar 201 Created (response imediata)│
-   └─────────────────────────────────────────┘
-
-2. PROCESSAMENTO (Assíncrono - BackgroundTask)
-   ┌─────────────────────────────────────────┐
-   │ BackgroundTask executa em paralelo       │
-   └────────────────┬────────────────────────┘
-                    │
-                    ▼
-   ┌─────────────────────────────────────────┐
-   │ FFmpeg extrai frames (fps=1)             │
-   │ Cria: frame_0001.png, frame_0002.png...│
-   └────────────────┬────────────────────────┘
-                    │
-                    ▼
-   ┌─────────────────────────────────────────┐
-   │ Compactar frames em ZIP (frames.zip)    │
-   └────────────────┬────────────────────────┘
-                    │
-                    ▼
-   ┌─────────────────────────────────────────┐
-   │ Atualizar banco (status=1: concluído)   │
-   │ Salvar caminho do ZIP em file_path      │
-   └──────────────────────────────────────────┘
-
-3. LISTAGEM (Síncrono)
-   ┌─────────────────────────────────────────┐
-   │ Usuário solicita GET /upload/videos/1   │
-   └────────────────┬────────────────────────┘
-                    │
-                    ▼
-   ┌─────────────────────────────────────────┐
-   │ Buscar vídeos do usuário no banco        │
-   └────────────────┬────────────────────────┘
-                    │
-                    ▼
-   ┌─────────────────────────────────────────┐
-   │ Retornar lista com status de cada vídeo │
-   │ [status 0, 1, 2, ...]                   │
-   └─────────────────────────────────────────┘
+Cliente HTTP
+  │
+  ▼
+FastAPI Route (app/api/upload.py)
+  │  valida extensão/content-type/tamanho + JWT
+  ▼
+UploadController
+  ▼
+UploadUseCase
+  ├── VideoProcessingGateway.save_upload()  -> uploads local ou S3
+  ├── VideoDAO.create_video(status=0)       -> tabela video
+  └── SQSProducer.send_message()            -> fila de processamento
 ```
+
+### 🔄 Fluxo fim a fim
+
+1. **Upload síncrono (neste serviço)**
+  - `POST /upload/video` recebe `user_id`, `title` e arquivo
+  - Valida extensão, MIME type e tamanho máximo (`MAX_UPLOAD_SIZE_MB`)
+  - Persiste arquivo (local em dev ou S3 em produção)
+  - Cria registro na tabela `video` com `status=0`
+  - Publica mensagem na fila SQS com metadados do vídeo
+  - Retorna `201` imediatamente
+
+2. **Processamento assíncrono (worker-service)**
+  - O worker consome a mensagem da fila
+  - Processa vídeo (FFmpeg), gera artefatos e atualiza status no banco
+  - `status` transita para `1` (concluído) ou `2` (erro)
+
+3. **Consulta de status (neste serviço)**
+  - `GET /upload/videos/{user_id}` consulta `VideoDAO.list_videos_by_user`
+  - Retorna lista ordenada por `id` desc com `file_path` e `status`
 
 ---
 
@@ -176,70 +90,38 @@ O **Video Upload & Processing Service** é um sistema que permite aos usuários:
 ```
 upload-service/
 ├── app/
-│   ├── __init__.py
-│   ├── main.py                    # Entrada da aplicação
+│   ├── main.py                         # Boot da aplicação e registro de rotas
 │   ├── api/
-│   │   ├── __init__.py
-│   │   ├── check.py              # Health check
-│   │   └── upload.py             # Endpoints de upload/listagem
+│   │   ├── check.py                    # /health e /health/db
+│   │   └── upload.py                   # Endpoints de upload e listagem
 │   ├── controllers/
-│   │   ├── __init__.py
-│   │   ├── upload_controller.py  # Orquestra upload
-│   │   └── list_videos_controller.py  # Orquestra listagem
+│   │   ├── upload_controller.py
+│   │   └── list_videos_controller.py
 │   ├── use_cases/
-│   │   ├── __init__.py
-│   │   ├── upload_use_case.py    # Lógica de upload
-│   │   └── process_video_use_case.py  # Lógica de processamento
+│   │   └── upload_use_case.py
 │   ├── gateways/
-│   │   ├── __init__.py
-│   │   ├── video_gateway.py      # Abstração de persistência
-│   │   └── video_processing_gateway.py  # Abstração de processamento (FFmpeg)
+│   │   ├── video_processing_gateway.py # Salvar upload (FS/S3)
+│   │   └── sqs_producer.py             # Publicar evento para processamento
 │   ├── dao/
-│   │   └── video_dao.py          # Acesso ao banco de dados
+│   │   └── video_dao.py
 │   ├── models/
-│   │   └── video.py              # Modelo SQLAlchemy
-│   ├── entities/
-│   │   └── video.py              # Interface de entidade
+│   │   └── video.py
 │   ├── adapters/
-│   │   ├── dto/
-│   │   │   └── video_dto.py      # Data Transfer Objects
-│   │   ├── schemas/
-│   │   │   └── video.py          # Pydantic schemas
-│   │   ├── presenters/
-│   │   │   └── video_presenter.py # Formatação de resposta
-│   │   └── utils/
-│   │       └── debug.py          # Utilitários
+│   │   ├── dto/video_dto.py
+│   │   ├── schemas/video.py
+│   │   └── presenters/video_presenter.py
 │   └── infrastructure/
-│       ├── api/
-│       │   └── fastapi.py        # Configuração FastAPI
-│       └── db/
-│           └── database.py       # Configuração SQLAlchemy
+│       ├── api/fastapi.py              # Instância FastAPI + startup
+│       ├── db/database.py              # Engine, sessão e init_schema
+│       └── security/auth.py            # JWT/Cognito e autorização por usuário
 ├── tests/
 │   ├── unit/
-│   │   ├── conftest.py
-│   │   ├── test_video_dao.py
-│   │   ├── test_upload_use_case.py
-│   │   ├── test_process_video_use_case.py
-│   │   ├── test_upload_controller.py
-│   │   ├── test_list_videos_controller.py
-│   │   ├── test_video_processing_gateway.py
-│   │   └── test_upload_api.py
 │   ├── integration/
-│   │   ├── conftest.py
-│   │   └── test_api_upload.py
-│   └── feature/
-│       ├── cliente.feature (skip)
-│       └── video.feature
-├── .docker/
-│   └── bin/
-│       ├── Dockerfile            # FFmpeg + Python
-│       └── config/
-│           └── requirements.txt
-├── uploads/                       # Vídeos enviados (temporário)
-├── temp/                          # Frames durante processamento (temporário)
-├── outputs/                       # ZIPs finais
-├── README.md
-└── docker-compose.yml
+│   └── smoke/
+├── uploads/                            # Upload local (dev)
+├── temp/                               # Área temporária
+├── outputs/
+└── README.md
 ```
 
 ---
@@ -429,7 +311,7 @@ DATABASE_URL=sqlite:///./coverage.db pytest tests/unit/ --cov=app --cov-report=x
 
 **Processamento:**
 - FFmpeg
-- Celery (opcional, para filas distribuídas)
+- Amazon SQS (desacoplamento entre upload e processamento)
 
 **Testing:**
 - pytest
@@ -447,7 +329,7 @@ DATABASE_URL=sqlite:///./coverage.db pytest tests/unit/ --cov=app --cov-report=x
 ### Clean Architecture
 
 ```
-presenta (API) → Controllers → UseCases → Gateways → DAOs → DB
+API → Controllers → UseCases → Gateways → DAOs → DB
 ```
 
 - **Controllers**: Orquestram requisições HTTP
@@ -459,7 +341,7 @@ presenta (API) → Controllers → UseCases → Gateways → DAOs → DB
 ### Assincronismo
 
 - Upload é **síncrono** (salva arquivo + registra no banco)
-- Processamento é **assíncrono** (BackgroundTasks do FastAPI)
+- Processamento é **assíncrono** (evento em SQS + execução no `worker-service`)
 - Permite múltiplos uploads simultâneos
 
 ### Injeção de Dependências
@@ -500,6 +382,11 @@ except Exception as e:
 
 ```mermaid
 classDiagram
+  class UploadRoute {
+    +POST /upload/video
+    +GET /upload/videos/{user_id}
+  }
+
     class VideoDAO {
         -db_session
         +create_video(dto)
@@ -510,19 +397,18 @@ classDiagram
     class UploadUseCase {
         -processing_gateway
         -video_dao
+      -sqs_producer
         +execute(user_id, title, file)
-    }
-
-    class ProcessVideoUseCase {
-        -processing_gateway
-        -video_dao
-        +execute(video_id, path, timestamp)
     }
 
     class VideoProcessingGateway {
         -base_dir
         +save_upload(file, timestamp)
-        +process_video(path, timestamp)
+    }
+
+    class SQSProducer {
+      -queue_url
+      +send_message(payload)
     }
 
     class UploadController {
@@ -535,11 +421,12 @@ classDiagram
         +list_user_videos(user_id)
     }
 
+    UploadRoute --> UploadController
+    UploadRoute --> ListVideosController
     VideoDAO --> Video
     UploadUseCase --> VideoDAO
     UploadUseCase --> VideoProcessingGateway
-    ProcessVideoUseCase --> VideoDAO
-    ProcessVideoUseCase --> VideoProcessingGateway
+    UploadUseCase --> SQSProducer
     UploadController --> UploadUseCase
     ListVideosController --> VideoDAO
 ```
@@ -558,9 +445,9 @@ classDiagram
 
 ## 📈 Performance
 
-- **Uploads simultâneos**: Não bloqueantes (BackgroundTasks)
+- **Uploads simultâneos**: `POST /upload/video` responde rápido após persistir arquivo + evento
 - **Listagem**: O(n) com ordenação por ID descendente
-- **Processamento**: CPU-bound (FFmpeg) em background thread
+- **Processamento**: executado fora da API (`worker-service`), reduzindo latência no upload
 - **Banco**: Índices em `user_id` para queries rápidas
 
 ---

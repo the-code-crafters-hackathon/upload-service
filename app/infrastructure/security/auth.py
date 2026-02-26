@@ -24,7 +24,8 @@ def _as_bool(value: str | None, default: bool) -> bool:
 
 
 def _is_auth_required() -> bool:
-    default_required = os.getenv("APP_ENV", "development").lower() == "production"
+    has_cognito_config = bool(os.getenv("COGNITO_ISSUER") and os.getenv("COGNITO_CLIENT_ID"))
+    default_required = os.getenv("APP_ENV", "development").lower() == "production" or has_cognito_config
     return _as_bool(os.getenv("AUTH_REQUIRED"), default_required)
 
 

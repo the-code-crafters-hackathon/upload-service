@@ -22,6 +22,12 @@ def test_as_bool_and_is_auth_required(monkeypatch):
     monkeypatch.setenv("AUTH_REQUIRED", "false")
     assert auth._is_auth_required() is False
 
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("COGNITO_ISSUER", "https://issuer")
+    monkeypatch.setenv("COGNITO_CLIENT_ID", "client")
+    assert auth._is_auth_required() is True
+
 
 def test_validate_audience_variants():
     auth._validate_audience({"token_use": "id", "aud": "abc"}, "abc")
